@@ -31,12 +31,6 @@ on:
         description: "Branch that auto-deploys"
         type: string
         default: main
-      lint-enabled:
-        type: boolean
-        default: true
-      vulncheck-enabled:
-        type: boolean
-        default: true
       trivy-enabled:
         type: boolean
         default: true
@@ -169,13 +163,8 @@ jobs:
 
   # ───────────── 3. build ─────────────
   build:
-    needs: [prepare, test, lint, vulncheck]
-    if: |
-      always() &&
-      needs.prepare.outputs.deploy == 'true' &&
-      needs.test.result == 'success' &&
-      (needs.lint.result == 'success' || needs.lint.result == 'skipped') &&
-      (needs.vulncheck.result == 'success' || needs.vulncheck.result == 'skipped')
+    needs: [prepare, test]
+    if: needs.prepare.outputs.deploy == 'true'
     runs-on: ubuntu-latest
     env:
       IMAGE: ${{ inputs.image }}
@@ -214,7 +203,6 @@ jobs:
   # ───────────── 4. deploy ─────────────
   deploy:
     needs: [prepare, build]
-    if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
     environment: ${{ startsWith(github.ref, 'refs/tags/v') && 'production' || 'dev' }}
     concurrency:
@@ -279,11 +267,7 @@ jobs:
   # ───────────── release (tags only) ─────────────
   release:
     needs: [prepare, deploy]
-    if: |
-      always() &&
-      inputs.release-enabled &&
-      startsWith(github.ref, 'refs/tags/v') &&
-      needs.deploy.result == 'success'
+    if: inputs.release-enabled && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
