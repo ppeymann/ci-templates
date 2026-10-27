@@ -1,0 +1,231 @@
+name: Next.js Docker CI/CD
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: "Docker image name, e.g. referendum-fe"
+        type: string
+        required: true
+      app-dir:
+        description: "Project dir on server (has docker-compose.yml), e.g. ~/referendum-fe"
+        type: string
+        required: true
+      service:
+        description: "Compose service to restart, e.g. referendum-fe"
+        type: string
+        required: true
+      health-url:
+        description: "Health URL checked from inside the server"
+        type: string
+        required: true
+      node-version:
+        type: string
+        default: "22"
+      platform:
+        type: string
+        default: linux/amd64
+      deploy-branch:
+        type: string
+        default: main
+      lint-enabled:
+        type: boolean
+        default: true
+      typecheck-enabled:
+        type: boolean
+        default: true
+      trivy-enabled:
+        type: boolean
+        default: true
+      trivy-fail:
+        type: boolean
+        default: false
+      release-enabled:
+        type: boolean
+        default: true
+      health-retries:
+        type: number
+        default: 20
+    secrets:
+      SSH_HOST:
+        required: true
+      SSH_PORT:
+        required: true
+      SSH_USER:
+        required: true
+      SSH_KEY:
+        required: true
+
+jobs:
+  # ───────────── 1. prepare ─────────────
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      deploy: ${{ steps.meta.outputs.deploy }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Version and deploy decision
+        id: meta
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_EVENT_NAME" != "pull_request" && "$GITHUB_REF_NAME" == "${{ inputs.deploy-branch }}" ]]; then
+            echo "version=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Lint
+        if: inputs.lint-enabled
+        run: npm run lint --if-present
+
+      - name: Typecheck
+        if: inputs.typecheck-enabled
+        run: npm run typecheck --if-present
+
+  # ───────────── 2. test ─────────────
+  test:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Unit tests
+        run: npm test --if-present
+
+  # ───────────── 3. build ─────────────
+  build:
+    needs: [prepare, test]
+    if: needs.prepare.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ${{ inputs.image }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        run: |
+          docker buildx build \
+            --platform ${{ inputs.platform }} \
+            -t "$IMAGE:$VERSION" \
+            -t "$IMAGE:latest" \
+            --load .
+
+      - name: Scan image (trivy)
+        if: inputs.trivy-enabled
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ env.VERSION }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: ${{ inputs.trivy-fail && '1' || '0' }}
+
+      - name: Save image
+        run: docker save "$IMAGE:$VERSION" "$IMAGE:latest" | gzip > image.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: image.tar.gz
+          retention-days: 3
+
+  # ───────────── 4. deploy ─────────────
+  deploy:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    environment: ${{ startsWith(github.ref, 'refs/tags/v') && 'production' || 'dev' }}
+    concurrency:
+      group: deploy-${{ inputs.image }}
+      cancel-in-progress: false
+    env:
+      IMAGE: ${{ inputs.image }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts
+          cat >> ~/.ssh/config <<EOF
+          Host server
+            HostName $SSH_HOST
+            Port $SSH_PORT
+            User $SSH_USER
+            IdentityFile ~/.ssh/id_ed25519
+            ServerAliveInterval 30
+          EOF
+
+      - name: Test SSH connection
+        run: ssh server 'echo "connected as $(whoami) on $(hostname)"'
+
+      - name: Ship image
+        run: gunzip -c image.tar.gz | ssh server 'docker load'
+
+      - name: Restart service
+        run: |
+          ssh server "cd ${{ inputs.app-dir }} && \
+            docker compose up -d --no-build --force-recreate ${{ inputs.service }}"
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 ${{ inputs.health-retries }}); do
+            CODE=$(ssh server "curl -s -o /dev/null -w '%{http_code}' ${{ inputs.health-url }}" || echo 000)
+            if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 500 ]; then
+              echo "healthy ✅ ($VERSION) http=$CODE"
+              echo "### Deployed \`$IMAGE:$VERSION\` ✅" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "waiting... ($i) http=$CODE"
+            sleep 3
+          done
+          echo "service did not become healthy ❌"
+          ssh server "cd ${{ inputs.app-dir }} && docker compose logs --tail 50 ${{ inputs.service }}"
+          exit 1
+
+      - name: Cleanup old images
+        if: always()
+        run: ssh server 'docker image prune -f' || true
+
+  # ───────────── release (tags only) ─────────────
+  release:
+    needs: [prepare, deploy]
+    if: inputs.release-enabled && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
