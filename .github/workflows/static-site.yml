@@ -1,0 +1,100 @@
+name: Static site
+
+on:
+  workflow_call:
+    inputs:
+      remote-dir:
+        description: "Path on the server where the build output goes"
+        type: string
+        required: true
+      health-url:
+        description: "URL checked on the server after deploy"
+        type: string
+        required: true
+      node-version:
+        type: string
+        default: "22"
+      build-command:
+        type: string
+        default: "npm run build"
+      out-dir:
+        type: string
+        default: "out"
+      build-env:
+        description: "KEY=VALUE lines added to the build environment"
+        type: string
+        default: ""
+      lint-enabled:
+        type: boolean
+        default: true
+      deploy-branch:
+        type: string
+        default: "main"
+    secrets:
+      SSH_HOST:
+        required: true
+      SSH_PORT:
+        required: true
+      SSH_USER:
+        required: true
+      SSH_KEY:
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Set build env
+        if: inputs.build-env != ''
+        run: echo "${{ inputs.build-env }}" >> "$GITHUB_ENV"
+
+      - run: npm ci
+
+      - name: Lint
+        if: inputs.lint-enabled
+        run: npm run lint --if-present
+
+      - name: Build
+        run: ${{ inputs.build-command }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: site
+          path: ${{ inputs.out-dir }}
+          retention-days: 3
+
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', inputs.deploy-branch)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: site
+          path: site
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Upload files
+        run: |
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/id_deploy -p ${{ secrets.SSH_PORT }}" \
+            site/ "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${{ inputs.remote-dir }}/"
+
+      - name: Health check
+        run: |
+          ssh -i ~/.ssh/id_deploy -p "${{ secrets.SSH_PORT }}" \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "curl -fsS -o /dev/null -w '%{http_code}\n' ${{ inputs.health-url }}"
