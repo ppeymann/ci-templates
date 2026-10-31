@@ -32,6 +32,7 @@
 - [Templates](#-templates)
 - [How a pipeline flows](#-how-a-pipeline-flows)
 - [What runs when](#-what-runs-when)
+- [Turn stages on/off](#-turn-stages-onoff)
 - [Quick start](#-quick-start)
   - [Go + Docker](#1-go--docker)
   - [Next.js + Docker](#2-nextjs--docker)
@@ -165,6 +166,47 @@ flowchart LR
 > [!TIP]
 > Want tests on **every** branch push without deploying? Use `branches: ["**"]` in the caller.
 > Deploy is still limited to `deploy-branch` (default `main`) and `v*` tags inside the template.
+
+## 🎛 Turn stages on/off
+
+Every stage can be switched off from your own `deploy.yml`. The names are the same in every template, and all default to `true`:
+
+| Toggle | Turns off | Templates |
+|---|---|---|
+| `lint-enabled` | lint · format · vet · typecheck · ruff · clippy · pint · SwiftLint · `flutter analyze` | all except spring, swift-vapor (they have no lint step) and `k8s-deploy` |
+| `typecheck-enabled` | `typecheck` script only | nextjs, node (+ `-k8s`) |
+| `test-enabled` | the whole **test** job. Build and deploy still run | all Docker / k8s templates, flutter; ios: the `Test` step (the compile check still runs) |
+| `coverage-enabled` | coverage summary, artifact, PR comment | go, django, fastapi, spring, dotnet (+ `-k8s`), flutter, ios |
+| `pr-coverage-comment` | only the sticky PR comment | same as above (server templates) |
+| `trivy-enabled` | image security scan | Docker / k8s templates |
+| `build-enabled` | image build (+ push). **Deploy and release are skipped too** | Docker / k8s templates, flutter (APK/AAB, so Play upload and release are skipped too), ios (archive + TestFlight/App Store) |
+| `deploy-enabled` | every deploy job: dev, stage, review, cleanup, manual rollback. **CI-only mode** | Docker / k8s templates, `k8s-deploy`, static-site |
+| `migrate-enabled`, `collectstatic-enabled` | DB migrations / static files on deploy | django, fastapi, laravel (k8s: set `migrate-command: ""`) |
+| `release-enabled` | GitHub Release on `v*` tags | all except static-site, `k8s-deploy` |
+| `testflight-enabled`, `appstore-submit`, `play-upload-enabled` | store uploads (off by default) | ios, flutter |
+
+Skipping a stage never blocks the stages after it. A stage that is **enabled and fails** still stops everything after it (no deploy, no release).
+With `deploy-enabled: false` a tag can still create a release. With `build-enabled: false` nothing is deployed or released.
+
+```yaml
+jobs:
+  pipeline:
+    uses: ppeymann/ci-templates/.github/workflows/go-docker.yml@v1
+    with:
+      image: my-backend
+      app-dir: ~/my-backend
+      service: my-backend
+      health-url: http://127.0.0.1:8080/health
+      test-enabled: false        # 🚫 no tests
+      release-enabled: false     # 🚫 no GitHub Release on tags
+      trivy-enabled: false       # 🚫 no image scan
+      # deploy-enabled: false    # CI only (lint + tests + build)
+    secrets:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_KEY: ${{ secrets.SSH_KEY }}
+```
 
 ## 🚀 Quick start
 
@@ -868,6 +910,11 @@ Turn it off with `pr-coverage-comment: false`. (node, nextjs, rust, laravel and 
 | `pr-coverage-comment` | boolean | `true` |  | Post a sticky coverage comment on pull requests (caller grants pull-requests: write) |
 | `auto-rollback` | boolean | `true` |  | On a failed deploy, retag :previous → :latest and recreate the services |
 | `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
+| `lint-enabled` | boolean | `true` |  | Run lint / format / vet steps |
+| `test-enabled` | boolean | `true` |  | Run the test job (when false, build/deploy still run) |
+| `coverage-enabled` | boolean | `true` |  | Coverage summary, artifact and PR comment |
+| `build-enabled` | boolean | `true` |  | Build (and push) the artifact; when false, deploy and release are skipped too |
+| `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 
 The `test` job starts **Postgres 17** and **Redis 8** and exports
 `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`, `REDIS_ADDR` for your tests.
@@ -902,6 +949,9 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports
 | `pr-coverage-comment` | boolean | `true` |  | Post a sticky coverage comment on pull requests (caller grants pull-requests: write) |
 | `auto-rollback` | boolean | `true` |  | On a failed deploy, retag :previous → :latest and recreate the services |
 | `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
+| `test-enabled` | boolean | `true` |  | Run the test job (when false, build/deploy still run) |
+| `build-enabled` | boolean | `true` |  | Build (and push) the artifact; when false, deploy and release are skipped too |
+| `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 </details>
 
 <details>
@@ -940,6 +990,10 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports
 | `pr-coverage-comment` | boolean | `true` |  | Post a sticky coverage comment on pull requests (caller grants pull-requests: write) |
 | `auto-rollback` | boolean | `true` |  | On a failed deploy, retag :previous → :latest and recreate the services |
 | `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
+| `test-enabled` | boolean | `true` |  | Run the test job (when false, build/deploy still run) |
+| `coverage-enabled` | boolean | `true` |  | Coverage summary, artifact and PR comment |
+| `build-enabled` | boolean | `true` |  | Build (and push) the artifact; when false, deploy and release are skipped too |
+| `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 
 The `test` job starts **Postgres 17** and **Redis 8** and exports common names so most settings files work as-is:
 `DATABASE_URL`, `DB_*`, `POSTGRES_*`, `REDIS_URL`, `CELERY_BROKER_URL`, `SECRET_KEY`, `DJANGO_SECRET_KEY` (dummy value), `DEBUG=False`.
@@ -980,6 +1034,10 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `pr-coverage-comment` | boolean | `true` |  | Post a sticky coverage comment on pull requests (caller grants pull-requests: write) |
 | `auto-rollback` | boolean | `true` |  | On a failed deploy, retag :previous → :latest and recreate the services |
 | `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
+| `test-enabled` | boolean | `true` |  | Run the test job (when false, build/deploy still run) |
+| `coverage-enabled` | boolean | `true` |  | Coverage summary, artifact and PR comment |
+| `build-enabled` | boolean | `true` |  | Build (and push) the artifact; when false, deploy and release are skipped too |
+| `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 </details>
 
 <details>
@@ -1012,6 +1070,10 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `pr-coverage-comment` | boolean | `true` |  | Post a sticky coverage comment on pull requests (caller grants pull-requests: write) |
 | `auto-rollback` | boolean | `true` |  | On a failed deploy, retag :previous → :latest and recreate the services |
 | `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
+| `test-enabled` | boolean | `true` |  | Run the test job (when false, build/deploy still run) |
+| `coverage-enabled` | boolean | `true` |  | Coverage summary, artifact and PR comment |
+| `build-enabled` | boolean | `true` |  | Build (and push) the artifact; when false, deploy and release are skipped too |
+| `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 </details>
 
 <details>
@@ -1045,6 +1107,9 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `pr-coverage-comment` | boolean | `true` |  | Post a sticky coverage comment on pull requests (caller grants pull-requests: write) |
 | `auto-rollback` | boolean | `true` |  | On a failed deploy, retag :previous → :latest and recreate the services |
 | `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
+| `test-enabled` | boolean | `true` |  | Run the test job (when false, build/deploy still run) |
+| `build-enabled` | boolean | `true` |  | Build (and push) the artifact; when false, deploy and release are skipped too |
+| `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 </details>
 
 <details>
@@ -1078,6 +1143,10 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `pr-coverage-comment` | boolean | `true` |  | Post a sticky coverage comment on pull requests (caller grants pull-requests: write) |
 | `auto-rollback` | boolean | `true` |  | On a failed deploy, retag :previous → :latest and recreate the services |
 | `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
+| `test-enabled` | boolean | `true` |  | Run the test job (when false, build/deploy still run) |
+| `coverage-enabled` | boolean | `true` |  | Coverage summary, artifact and PR comment |
+| `build-enabled` | boolean | `true` |  | Build (and push) the artifact; when false, deploy and release are skipped too |
+| `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 </details>
 
 <details>
@@ -1109,6 +1178,10 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `pr-coverage-comment` | boolean | `true` |  | Post a sticky coverage comment on pull requests (caller grants pull-requests: write) |
 | `auto-rollback` | boolean | `true` |  | On a failed deploy, retag :previous → :latest and recreate the services |
 | `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
+| `lint-enabled` | boolean | `true` |  | Run lint / format / vet steps |
+| `test-enabled` | boolean | `true` |  | Run the test job (when false, build/deploy still run) |
+| `build-enabled` | boolean | `true` |  | Build (and push) the artifact; when false, deploy and release are skipped too |
+| `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 </details>
 
 <details>
@@ -1144,6 +1217,10 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `pr-coverage-comment` | boolean | `true` |  | Post a sticky coverage comment on pull requests (caller grants pull-requests: write) |
 | `auto-rollback` | boolean | `true` |  | On a failed deploy, retag :previous → :latest and recreate the services |
 | `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
+| `lint-enabled` | boolean | `true` |  | Run lint / format / vet steps |
+| `test-enabled` | boolean | `true` |  | Run the test job (when false, build/deploy still run) |
+| `build-enabled` | boolean | `true` |  | Build (and push) the artifact; when false, deploy and release are skipped too |
+| `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 </details>
 
 <details>
@@ -1175,6 +1252,9 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `pr-coverage-comment` | boolean | `true` |  | Post a sticky coverage comment on pull requests (caller grants pull-requests: write) |
 | `auto-rollback` | boolean | `true` |  | On a failed deploy, retag :previous → :latest and recreate the services |
 | `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
+| `test-enabled` | boolean | `true` |  | Run the test job (when false, build/deploy still run) |
+| `build-enabled` | boolean | `true` |  | Build (and push) the artifact; when false, deploy and release are skipped too |
+| `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 </details>
 
 <details>
@@ -1213,6 +1293,7 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `helm-extra-args` | string | `""` |  |  |
 | `migrate-command` | string | `""` |  | If set, runs as a one-off k8s Job with the new image (same env/volumes as the Deployment) before rollout |
 | `rollout-timeout` | string | `5m` |  |  |
+| `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 
 Every `*-k8s.yml` takes its Docker twin's inputs **minus** `app-dir`, `service(s)`, `health-url`, `health-retries`, `platform` and the compose-migration inputs, **plus** `registry`, `image-namespace`, `build-platforms` (e.g. `linux/amd64,linux/arm64`) and all deploy inputs above except `image-ref`. Its `deploy-branch` input is not used for k8s; use `stage-branches`.
 </details>
@@ -1236,6 +1317,8 @@ Every `*-k8s.yml` takes its Docker twin's inputs **minus** `app-dir`, `service(s
 | `appstore-automatic-release` | boolean | `false` |  | Release automatically once Apple approves |
 | `export-method` | string | `app-store-connect` |  | app-store-connect \| release-testing \| debugging |
 | `release-enabled` | boolean | `true` |  | Create a GitHub release on v* tags (attaches IPA if built) |
+| `coverage-enabled` | boolean | `true` |  | Coverage summary, artifact and PR comment |
+| `build-enabled` | boolean | `true` |  | Build (and push) the artifact; when false, deploy and release are skipped too |
 </details>
 
 <details>
@@ -1256,6 +1339,10 @@ Every `*-k8s.yml` takes its Docker twin's inputs **minus** `app-dir`, `service(s
 | `play-package-name` | string | `""` |  | Android applicationId, e.g. com.example.myapp |
 | `play-track` | string | `internal` |  | internal \| alpha \| beta \| production |
 | `play-release-status` | string | `completed` |  | completed \| draft \| inProgress |
+| `lint-enabled` | boolean | `true` |  | Run lint / format / vet steps |
+| `test-enabled` | boolean | `true` |  | Run the test job (when false, build/deploy still run) |
+| `coverage-enabled` | boolean | `true` |  | Coverage summary, artifact and PR comment |
+| `build-enabled` | boolean | `true` |  | Build (and push) the artifact; when false, deploy and release are skipped too |
 </details>
 
 <details>
@@ -1277,6 +1364,7 @@ Every `*-k8s.yml` takes its Docker twin's inputs **minus** `app-dir`, `service(s
 | `stage-build-env` | string | `""` |  | Extra KEY=VALUE build env for STAGE builds (added after build-env) |
 | `review-enabled` | boolean | `false` |  | rsync each branch / same-repo PR build to <remote-dir>-review/<slug> |
 | `review-domain` | string | `""` |  | Shown as the review URL: https://<slug>.<review-domain> (your web server maps it) |
+| `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 </details>
 
 ## 🔐 Secrets & variables

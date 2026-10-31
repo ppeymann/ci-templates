@@ -48,6 +48,22 @@ on:
         description: "completed | draft | inProgress"
         type: string
         default: completed
+      lint-enabled:
+        description: "Run lint / format / vet steps"
+        type: boolean
+        default: true
+      test-enabled:
+        description: "Run the test job (when false, build/deploy still run)"
+        type: boolean
+        default: true
+      coverage-enabled:
+        description: "Coverage summary, artifact and PR comment"
+        type: boolean
+        default: true
+      build-enabled:
+        description: "Build (and push) the artifact; when false, deploy and release are skipped too"
+        type: boolean
+        default: true
     secrets:
       PLAY_SERVICE_ACCOUNT_JSON:
         description: "Google Play service-account JSON (plain text)"
@@ -103,14 +119,17 @@ jobs:
         run: flutter pub get
 
       - name: Format check
+        if: inputs.lint-enabled
         run: dart format --output=none --set-exit-if-changed .
 
       - name: Analyze
+        if: inputs.lint-enabled
         run: flutter analyze
 
   # ───────────── 2. test ─────────────
   test:
     needs: prepare
+    if: inputs.test-enabled
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -130,7 +149,7 @@ jobs:
           if [ -d test ]; then flutter test --coverage; else echo "no test dir"; fi
 
       - name: Coverage summary
-        if: always()
+        if: inputs.coverage-enabled && (always())
         run: |
           if [ -f coverage/lcov.info ]; then
             TOTAL=$(awk -F: '/^LF:/ {t+=$2} /^LH:/ {h+=$2} END {if (t>0) printf "%.1f%% lines", 100*h/t}' coverage/lcov.info)
@@ -141,7 +160,7 @@ jobs:
   # ───────────── 3. build ─────────────
   build:
     needs: [prepare, test]
-    if: needs.prepare.outputs.build == 'true'
+    if: always() && inputs.build-enabled && needs.prepare.result == 'success' && (needs.test.result == 'success' || needs.test.result == 'skipped') && (needs.prepare.outputs.build == 'true')
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -208,7 +227,7 @@ jobs:
   # ───────────── Google Play (tags, opt-in) ─────────────
   play:
     needs: [prepare, build]
-    if: inputs.play-upload-enabled && startsWith(github.ref, 'refs/tags/v')
+    if: always() && needs.build.result == 'success' && (inputs.play-upload-enabled && startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     environment: production
     steps:
@@ -239,7 +258,7 @@ jobs:
   # ───────────── release (tags only) ─────────────
   release:
     needs: [prepare, build]
-    if: inputs.release-enabled && startsWith(github.ref, 'refs/tags/v')
+    if: always() && needs.build.result == 'success' && (inputs.release-enabled && startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     permissions:
       contents: write

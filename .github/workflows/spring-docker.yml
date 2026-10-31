@@ -97,6 +97,22 @@ on:
         description: "Manual rollback: skip build, restore :previous (use with workflow_dispatch)"
         type: boolean
         default: false
+      test-enabled:
+        description: "Run the test job (when false, build/deploy still run)"
+        type: boolean
+        default: true
+      coverage-enabled:
+        description: "Coverage summary, artifact and PR comment"
+        type: boolean
+        default: true
+      build-enabled:
+        description: "Build (and push) the artifact; when false, deploy and release are skipped too"
+        type: boolean
+        default: true
+      deploy-enabled:
+        description: "Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only"
+        type: boolean
+        default: true
     secrets:
       SSH_HOST:
         required: true
@@ -199,6 +215,7 @@ jobs:
   # ───────────── 2. test ─────────────
   test:
     needs: prepare
+    if: inputs.test-enabled
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -275,7 +292,7 @@ jobs:
           fi
 
       - name: JaCoCo summary
-        if: always()
+        if: inputs.coverage-enabled && (always())
         run: |
           CSV=$(find . -name 'jacoco*.csv' -path '*jacoco*' | head -1)
           if [ -n "$CSV" ]; then
@@ -288,7 +305,7 @@ jobs:
           fi
 
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: inputs.coverage-enabled && (always())
         with:
           name: test-reports
           path: |
@@ -299,7 +316,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Coverage comment on PR
-        if: always() && inputs.pr-coverage-comment && github.event_name == 'pull_request' && env.COVERAGE_TOTAL != '' && github.event.pull_request.head.repo.full_name == github.repository
+        if: inputs.coverage-enabled && (always() && inputs.pr-coverage-comment && github.event_name == 'pull_request' && env.COVERAGE_TOTAL != '' && github.event.pull_request.head.repo.full_name == github.repository)
         continue-on-error: true
         uses: marocchino/sticky-pull-request-comment@v2
         with:
@@ -312,7 +329,7 @@ jobs:
   # ───────────── 3. build ─────────────
   build:
     needs: [prepare, test]
-    if: needs.prepare.outputs.deploy == 'true'
+    if: always() && inputs.build-enabled && needs.prepare.result == 'success' && (needs.test.result == 'success' || needs.test.result == 'skipped') && (needs.prepare.outputs.deploy == 'true')
     runs-on: ubuntu-latest
     env:
       IMAGE: ${{ inputs.image }}
@@ -350,7 +367,7 @@ jobs:
   # ───────────── 4. deploy (dev / stage / production) ─────────────
   deploy:
     needs: [prepare, build]
-    if: needs.prepare.outputs.target == 'dev' || needs.prepare.outputs.target == 'stage' || needs.prepare.outputs.target == 'production'
+    if: always() && inputs.deploy-enabled && needs.build.result == 'success' && (needs.prepare.outputs.target == 'dev' || needs.prepare.outputs.target == 'stage' || needs.prepare.outputs.target == 'production')
     runs-on: ubuntu-latest
     environment: ${{ needs.prepare.outputs.target }}
     concurrency:
@@ -435,7 +452,7 @@ jobs:
   # ───────────── 4b. review app (Traefik) ─────────────
   review:
     needs: [prepare, build]
-    if: needs.prepare.outputs.target == 'review'
+    if: always() && inputs.deploy-enabled && needs.build.result == 'success' && (needs.prepare.outputs.target == 'review')
     runs-on: ubuntu-latest
     environment:
       name: review/${{ needs.prepare.outputs.slug }}
@@ -503,7 +520,7 @@ jobs:
 
   # ───────────── cleanup review app (branch deleted / PR closed) ─────────────
   cleanup:
-    if: inputs.review-enabled && (github.event_name == 'delete' || (github.event_name == 'pull_request' && github.event.action == 'closed'))
+    if: inputs.deploy-enabled && (inputs.review-enabled && (github.event_name == 'delete' || (github.event_name == 'pull_request' && github.event.action == 'closed')))
     runs-on: ubuntu-latest
     env:
       SSH_HOST: ${{ secrets.SSH_HOST }}
@@ -557,7 +574,7 @@ jobs:
 
   # ───────────── manual rollback (workflow_dispatch + rollback: true) ─────────────
   rollback:
-    if: inputs.rollback
+    if: inputs.deploy-enabled && (inputs.rollback)
     runs-on: ubuntu-latest
     environment: ${{ startsWith(github.ref, 'refs/tags/v') && 'production' || (inputs.stage-app-dir != '' && github.ref_name != inputs.deploy-branch) && 'stage' || 'dev' }}
     concurrency:
@@ -627,8 +644,8 @@ jobs:
 
   # ───────────── release (tags only) ─────────────
   release:
-    needs: [prepare, deploy]
-    if: inputs.release-enabled && startsWith(github.ref, 'refs/tags/v')
+    needs: [prepare, test, deploy]
+    if: always() && inputs.release-enabled && startsWith(github.ref, 'refs/tags/v') && needs.prepare.result == 'success' && (needs.test.result == 'success' || needs.test.result == 'skipped') && (needs.deploy.result == 'success' || (needs.deploy.result == 'skipped' && !inputs.deploy-enabled))
     runs-on: ubuntu-latest
     permissions:
       contents: write

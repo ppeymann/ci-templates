@@ -166,6 +166,22 @@ on:
         description: "Post a sticky coverage comment on pull requests (caller grants pull-requests: write)"
         type: boolean
         default: true
+      test-enabled:
+        description: "Run the test job (when false, build/deploy still run)"
+        type: boolean
+        default: true
+      coverage-enabled:
+        description: "Coverage summary, artifact and PR comment"
+        type: boolean
+        default: true
+      build-enabled:
+        description: "Build (and push) the artifact; when false, deploy and release are skipped too"
+        type: boolean
+        default: true
+      deploy-enabled:
+        description: "Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only"
+        type: boolean
+        default: true
     secrets:
       KUBE_CONFIG_PROD:
         description: "base64 kubeconfig for PROD"
@@ -248,6 +264,7 @@ jobs:
   # ───────────── 2. test ─────────────
   test:
     needs: prepare
+    if: inputs.test-enabled
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -324,7 +341,7 @@ jobs:
           fi
 
       - name: JaCoCo summary
-        if: always()
+        if: inputs.coverage-enabled && (always())
         run: |
           CSV=$(find . -name 'jacoco*.csv' -path '*jacoco*' | head -1)
           if [ -n "$CSV" ]; then
@@ -337,7 +354,7 @@ jobs:
           fi
 
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: inputs.coverage-enabled && (always())
         with:
           name: test-reports
           path: |
@@ -429,7 +446,7 @@ jobs:
           echo "### Target: \`$ENV\` → \`$NS/$NAME\` ${URL}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Coverage comment on PR
-        if: always() && inputs.pr-coverage-comment && github.event_name == 'pull_request' && env.COVERAGE_TOTAL != '' && github.event.pull_request.head.repo.full_name == github.repository
+        if: inputs.coverage-enabled && (always() && inputs.pr-coverage-comment && github.event_name == 'pull_request' && env.COVERAGE_TOTAL != '' && github.event.pull_request.head.repo.full_name == github.repository)
         continue-on-error: true
         uses: marocchino/sticky-pull-request-comment@v2
         with:
@@ -442,7 +459,7 @@ jobs:
   # ───────────── 3. build + push ─────────────
   build:
     needs: [prepare, test, target]
-    if: needs.target.outputs.env != 'none'
+    if: always() && inputs.build-enabled && needs.prepare.result == 'success' && (needs.test.result == 'success' || needs.test.result == 'skipped') && needs.target.result == 'success' && (needs.target.outputs.env != 'none')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -499,7 +516,7 @@ jobs:
   # ───────────── 4. deploy (kubernetes) ─────────────
   deploy:
     needs: [target, build]
-    if: needs.target.outputs.env != 'none'
+    if: always() && inputs.deploy-enabled && needs.build.result == 'success' && (needs.target.outputs.env != 'none')
     runs-on: ubuntu-latest
     environment:
       name: ${{ needs.target.outputs.env-name }}
@@ -671,7 +688,7 @@ jobs:
 
   # ───────────── cleanup (branch deleted / PR closed) ─────────────
   cleanup:
-    if: github.event_name == 'delete' || (github.event_name == 'pull_request' && github.event.action == 'closed')
+    if: inputs.deploy-enabled && (github.event_name == 'delete' || (github.event_name == 'pull_request' && github.event.action == 'closed'))
     runs-on: ubuntu-latest
     env:
       TARGET: review
@@ -727,8 +744,8 @@ jobs:
 
   # ───────────── release (tags only) ─────────────
   release:
-    needs: [prepare, deploy]
-    if: inputs.release-enabled && startsWith(github.ref, 'refs/tags/v')
+    needs: [prepare, test, deploy]
+    if: always() && inputs.release-enabled && startsWith(github.ref, 'refs/tags/v') && needs.prepare.result == 'success' && (needs.test.result == 'success' || needs.test.result == 'skipped') && (needs.deploy.result == 'success' || (needs.deploy.result == 'skipped' && !inputs.deploy-enabled))
     runs-on: ubuntu-latest
     permissions:
       contents: write

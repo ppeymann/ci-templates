@@ -54,6 +54,10 @@ on:
         description: "Shown as the review URL: https://<slug>.<review-domain> (your web server maps it)"
         type: string
         default: ""
+      deploy-enabled:
+        description: "Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only"
+        type: boolean
+        default: true
     secrets:
       SSH_HOST:
         required: true
@@ -129,7 +133,7 @@ jobs:
 
   deploy:
     needs: [target, build]
-    if: needs.target.outputs.target != 'none'
+    if: always() && inputs.deploy-enabled && needs.build.result == 'success' && (needs.target.outputs.target != 'none')
     runs-on: ubuntu-latest
     environment:
       name: ${{ needs.target.outputs.target == 'review' && format('review/{0}', needs.target.outputs.slug) || needs.target.outputs.target }}
@@ -169,7 +173,7 @@ jobs:
 
   # ───────────── cleanup review (branch deleted / PR closed) ─────────────
   cleanup:
-    if: inputs.review-enabled && (github.event_name == 'delete' || (github.event_name == 'pull_request' && github.event.action == 'closed'))
+    if: inputs.deploy-enabled && (inputs.review-enabled && (github.event_name == 'delete' || (github.event_name == 'pull_request' && github.event.action == 'closed')))
     runs-on: ubuntu-latest
     env:
       DELETED_REF: ${{ github.event.ref }}

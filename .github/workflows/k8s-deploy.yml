@@ -124,6 +124,10 @@ on:
       rollout-timeout:
         type: string
         default: 5m
+      deploy-enabled:
+        description: "Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only"
+        type: boolean
+        default: true
     secrets:
       KUBE_CONFIG_PROD:
         description: "base64 kubeconfig for PROD"
@@ -221,7 +225,7 @@ jobs:
   # ───────────── 4. deploy (kubernetes) ─────────────
   deploy:
     needs: [target]
-    if: needs.target.outputs.env != 'none'
+    if: inputs.deploy-enabled && (needs.target.outputs.env != 'none')
     runs-on: ubuntu-latest
     environment:
       name: ${{ needs.target.outputs.env-name }}
@@ -393,7 +397,7 @@ jobs:
 
   # ───────────── cleanup (branch deleted / PR closed) ─────────────
   cleanup:
-    if: github.event_name == 'delete' || (github.event_name == 'pull_request' && github.event.action == 'closed')
+    if: inputs.deploy-enabled && (github.event_name == 'delete' || (github.event_name == 'pull_request' && github.event.action == 'closed'))
     runs-on: ubuntu-latest
     env:
       TARGET: review

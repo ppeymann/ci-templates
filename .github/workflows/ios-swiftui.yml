@@ -56,6 +56,14 @@ on:
         description: "Create a GitHub release on v* tags (attaches IPA if built)"
         type: boolean
         default: true
+      coverage-enabled:
+        description: "Coverage summary, artifact and PR comment"
+        type: boolean
+        default: true
+      build-enabled:
+        description: "Build (and push) the artifact; when false, deploy and release are skipped too"
+        type: boolean
+        default: true
     secrets:
       APP_STORE_CONNECT_KEY_ID:
         required: false
@@ -147,7 +155,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO test-without-building -quiet
 
       - name: Coverage summary
-        if: always() && inputs.test-enabled
+        if: inputs.coverage-enabled && (always() && inputs.test-enabled)
         run: |
           if [ -d TestResults.xcresult ]; then
             TOTAL=$(xcrun xccov view --report TestResults.xcresult | head -2 | tail -1)
@@ -166,7 +174,7 @@ jobs:
   # ───────────── 3. archive + TestFlight (tags, opt-in) ─────────────
   testflight:
     needs: [prepare, test]
-    if: inputs.testflight-enabled && startsWith(github.ref, 'refs/tags/v')
+    if: always() && inputs.build-enabled && needs.prepare.result == 'success' && needs.test.result == 'success' && (inputs.testflight-enabled && startsWith(github.ref, 'refs/tags/v'))
     runs-on: ${{ inputs.runs-on }}
     environment: production
     defaults:
