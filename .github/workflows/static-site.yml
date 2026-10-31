@@ -30,6 +30,30 @@ on:
       deploy-branch:
         type: string
         default: "main"
+      stage-branches:
+        description: "Regex of branches deployed to the `stage` environment (only if stage-remote-dir is set)"
+        type: string
+        default: develop
+      stage-remote-dir:
+        description: "Server path for STAGE (empty = stage disabled)"
+        type: string
+        default: ""
+      stage-health-url:
+        description: "Health URL for STAGE (empty = same as health-url)"
+        type: string
+        default: ""
+      stage-build-env:
+        description: "Extra KEY=VALUE build env for STAGE builds (added after build-env)"
+        type: string
+        default: ""
+      review-enabled:
+        description: "rsync each branch / same-repo PR build to <remote-dir>-review/<slug>"
+        type: boolean
+        default: false
+      review-domain:
+        description: "Shown as the review URL: https://<slug>.<review-domain> (your web server maps it)"
+        type: string
+        default: ""
     secrets:
       SSH_HOST:
         required: true
@@ -41,7 +65,36 @@ on:
         required: true
 
 jobs:
+  # ───────────── target ─────────────
+  target:
+    if: ${{ !(github.event_name == 'delete' || (github.event_name == 'pull_request' && github.event.action == 'closed')) }}
+    runs-on: ubuntu-latest
+    outputs:
+      target: ${{ steps.t.outputs.target }}
+      slug: ${{ steps.t.outputs.slug }}
+    steps:
+      - name: Pick target
+        id: t
+        env:
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          STAGE_RE: ${{ inputs.stage-branches }}
+        run: |
+          slugify() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-30 | sed -E 's/-+$//'; }
+          T=none; SLUG=""
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            if [ "${{ inputs.review-enabled }}" = true ] && [ "$HEAD_REPO" = "$GITHUB_REPOSITORY" ]; then T=review; SLUG="pr-$PR_NUMBER"; fi
+          elif [ "$GITHUB_REF_NAME" = "${{ inputs.deploy-branch }}" ] && [[ "$GITHUB_REF" == refs/heads/* ]]; then
+            T=dev
+          elif [ -n "${{ inputs.stage-remote-dir }}" ] && [[ "$GITHUB_REF_NAME" =~ ^($STAGE_RE)$ ]]; then
+            T=stage
+          elif [ "${{ inputs.review-enabled }}" = true ] && [ "$GITHUB_EVENT_NAME" = push ] && [[ "$GITHUB_REF" == refs/heads/* ]]; then
+            T=review; SLUG=$(slugify "$GITHUB_REF_NAME")
+          fi
+          { echo "target=$T"; echo "slug=$SLUG"; } >> "$GITHUB_OUTPUT"
+
   build:
+    needs: target
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,6 +107,10 @@ jobs:
       - name: Set build env
         if: inputs.build-env != ''
         run: echo "${{ inputs.build-env }}" >> "$GITHUB_ENV"
+
+      - name: Set stage build env
+        if: needs.target.outputs.target == 'stage' && inputs.stage-build-env != ''
+        run: echo "${{ inputs.stage-build-env }}" >> "$GITHUB_ENV"
 
       - run: npm ci
 
@@ -71,9 +128,18 @@ jobs:
           retention-days: 3
 
   deploy:
-    needs: build
-    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', inputs.deploy-branch)
+    needs: [target, build]
+    if: needs.target.outputs.target != 'none'
     runs-on: ubuntu-latest
+    environment:
+      name: ${{ needs.target.outputs.target == 'review' && format('review/{0}', needs.target.outputs.slug) || needs.target.outputs.target }}
+      url: ${{ needs.target.outputs.target == 'review' && inputs.review-domain != '' && format('https://{0}.{1}', needs.target.outputs.slug, inputs.review-domain) || '' }}
+    concurrency:
+      group: static-${{ inputs.remote-dir }}-${{ needs.target.outputs.target }}-${{ needs.target.outputs.slug }}
+      cancel-in-progress: false
+    env:
+      DEST: ${{ needs.target.outputs.target == 'stage' && inputs.stage-remote-dir || needs.target.outputs.target == 'review' && format('{0}-review/{1}', inputs.remote-dir, needs.target.outputs.slug) || inputs.remote-dir }}
+      HEALTH_URL: ${{ needs.target.outputs.target == 'stage' && inputs.stage-health-url != '' && inputs.stage-health-url || inputs.health-url }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -89,12 +155,41 @@ jobs:
 
       - name: Upload files
         run: |
+          ssh -i ~/.ssh/id_deploy -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" "mkdir -p $DEST"
           rsync -az --delete \
             -e "ssh -i ~/.ssh/id_deploy -p ${{ secrets.SSH_PORT }}" \
-            site/ "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${{ inputs.remote-dir }}/"
+            site/ "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:$DEST/"
 
       - name: Health check
+        if: needs.target.outputs.target != 'review'
         run: |
           ssh -i ~/.ssh/id_deploy -p "${{ secrets.SSH_PORT }}" \
             "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
-            "curl -fsS -o /dev/null -w '%{http_code}\n' ${{ inputs.health-url }}"
+            "curl -fsS -o /dev/null -w '%{http_code}\n' $HEALTH_URL"
+
+  # ───────────── cleanup review (branch deleted / PR closed) ─────────────
+  cleanup:
+    if: inputs.review-enabled && (github.event_name == 'delete' || (github.event_name == 'pull_request' && github.event.action == 'closed'))
+    runs-on: ubuntu-latest
+    env:
+      DELETED_REF: ${{ github.event.ref }}
+      REF_TYPE: ${{ github.event.ref_type }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Remove review build
+        run: |
+          slugify() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-30 | sed -E 's/-+$//'; }
+          if [ "$GITHUB_EVENT_NAME" = delete ]; then
+            [ "$REF_TYPE" = branch ] || exit 0
+            SLUG=$(slugify "$DELETED_REF")
+          else
+            SLUG="pr-$PR_NUMBER"
+          fi
+          [ -n "$SLUG" ] || exit 0
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
+          ssh -i ~/.ssh/id_deploy -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "rm -rf '${{ inputs.remote-dir }}-review/$SLUG'"
+          echo "### 🧹 Removed review build $SLUG" >> "$GITHUB_STEP_SUMMARY"

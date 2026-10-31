@@ -1,0 +1,33 @@
+# Put next to your app's docker-compose.yml (review-compose-file input).
+# CI runs: IMAGE_TAG=sha-abc1234 REVIEW_HOST=feature-x.review.example.com SLUG=feature-x \
+#          docker compose -p my-backend-feature-x -f docker-compose.review.yml up -d
+services:
+  app:
+    image: my-backend:${IMAGE_TAG}
+    restart: unless-stopped
+    env_file: .env.review          # shared review settings (no prod secrets!)
+    environment:
+      DATABASE_URL: postgres://app:app@db:5432/app
+    depends_on: [db]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.${SLUG}.rule=Host(`${REVIEW_HOST}`)
+      - traefik.http.routers.${SLUG}.entrypoints=websecure
+      - traefik.http.routers.${SLUG}.tls.certresolver=le
+      - traefik.http.services.${SLUG}.loadbalancer.server.port=8000
+    networks: [web, default]
+
+  db:                              # throwaway DB per review app (removed with down -v)
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    volumes: [db:/var/lib/postgresql/data]
+
+volumes:
+  db:
+
+networks:
+  web:
+    external: true

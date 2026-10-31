@@ -42,13 +42,14 @@
   - [iOS SwiftUI](#7-ios-swiftui)
   - [Flutter (Android)](#8-flutter-android)
 - [Kubernetes](#-kubernetes)
+- [Stage, review apps, rollback & PR coverage](#-stage-review-apps-rollback--pr-coverage)
+- [App stores (Play / App Store)](#-app-stores)
 - [Inputs reference](#-inputs-reference)
 - [Secrets & variables](#-secrets--variables)
 - [Server prerequisites](#-server-prerequisites)
 - [Deploy under the hood](#-deploy-under-the-hood)
 - [Versioning the templates](#-versioning-the-templates)
 - [Troubleshooting](#-troubleshooting)
-- [Roadmap](#-roadmap)
 
 ---
 
@@ -85,6 +86,9 @@ ci-templates/
 examples/k8s/
     ├── app.yaml                     # Deployment + Service + Ingress
     └── ci-rbac.yaml                 # namespace-scoped ServiceAccount for CI
+examples/traefik/
+    ├── docker-compose.traefik.yml   # Traefik + Let's Encrypt for review apps
+    └── docker-compose.review.yml    # per-branch review app (IMAGE_TAG, REVIEW_HOST, SLUG)
 ```
 
 ## 🗂 Templates
@@ -145,11 +149,18 @@ flowchart LR
 
 | Event | prepare / test | build | deploy | environment | release |
 |---|:-:|:-:|:-:|---|:-:|
-| Pull request | ✅ | – | – | – | – |
-| Push to another branch | – (not triggered by default) | – | – | – | – |
+| Pull request | ✅ (+ sticky coverage comment) | review only¹ | review app¹ | `review/pr-<n>`¹ | – |
+| Push to a `stage-branches` branch (default `develop`) | ✅ | ✅² | ✅² | `stage`² | – |
+| Push to another branch | ✅ if triggered | review only¹ | review app¹ | `review/<slug>`¹ | – |
 | Push to `main` | ✅ | ✅ | ✅ | `dev` | – |
 | Tag `v*` (e.g. `v1.2.0`) | ✅ | ✅ | ✅ | `production` | ✅ |
 | Manual (`workflow_dispatch`) on `main` | ✅ | ✅ | ✅ | `dev` | – |
+| Manual with `rollback: true` | – | – | ↩️ restore `:previous` | `dev` / `stage` / `production` (by ref) | – |
+| Branch deleted / PR closed | – | – | 🧹 review app removed¹ | – | – |
+| Failed deploy (health check / migrate) | | | ↩️ automatic `:previous` (`auto-rollback`) | same | – |
+
+¹ only with `review-enabled: true` (Docker & static templates; same-repo PRs only, forks never deploy) ·
+² only when `stage-app-dir` (static: `stage-remote-dir`) is set. Without it nothing changes.
 
 > [!TIP]
 > Want tests on **every** branch push without deploying? Use `branches: ["**"]` in the caller.
@@ -586,6 +597,8 @@ jobs:
       scheme: MyApp
       project: MyApp.xcodeproj          # or MyApp.xcworkspace
       testflight-enabled: true          # only on v* tags; needs the Apple secrets below
+      appstore-submit: true             # optional: also submit for App Store review
+      app-identifier: com.example.myapp
     secrets:
       APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
       APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
@@ -620,7 +633,11 @@ jobs:
     with:
       flutter-version: "3.27.0"
       build-args: --dart-define=API_URL=https://api.example.com
-
+      play-upload-enabled: true          # v* tags → Google Play
+      play-package-name: com.example.myapp
+      play-track: internal               # or production
+    secrets:
+      PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
 ```
 
 Signing is optional: add `ANDROID_KEYSTORE` (base64 `.jks`), `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`
@@ -715,6 +732,113 @@ base64 < stage-kubeconfig.yaml | tr -d '\n' | pbcopy   # KUBE_CONFIG_STAGE (opti
 > Review apps from **fork** PRs are never deployed (no secrets, untrusted code). Wildcard TLS via HTTP-01 issues one certificate per review host,
 > so watch Let's Encrypt rate limits; use a DNS-01 wildcard certificate for busy repos.
 
+## 🧭 Stage, review apps, rollback & PR coverage
+
+These features are built into every **Docker** template (`go`, `nextjs`, `django`, `fastapi`, `spring`, `node`, `dotnet`, `rust`, `laravel`, `swift-vapor`).
+`static-site.yml` has stage and review too, but no rollback.
+They are all **backward compatible**: with no new inputs a template behaves exactly like before (plus automatic rollback, which only acts when a deploy fails).
+
+### 🧪 Stage environment (`develop`)
+
+Set `stage-app-dir` and pushes to `stage-branches` (regex, default `develop`) deploy to the GitHub environment **`stage`**:
+
+```yaml
+    with:
+      image: my-backend
+      app-dir: ~/my-backend
+      services: web worker
+      health-url: http://127.0.0.1:8000/health
+      stage-app-dir: ~/my-backend-stage            # its own docker-compose.yml + .env
+      stage-health-url: http://127.0.0.1:8100/health
+      # stage-services: web                        # default: same as services
+```
+
+On the server, stage uses the moving tag **`<image>:stage`** (dev/prod use `:latest`), so the stage compose file must say
+`image: my-backend:stage` and publish a different port. Static sites: `stage-remote-dir`, `stage-health-url`, `stage-build-env`.
+
+### 👀 Review apps per branch (Traefik + wildcard DNS)
+
+```mermaid
+flowchart LR
+    P([push feature/x · PR #12]) --> B["🐳 build image:sha-xxxx"]
+    B --> L["ssh · docker load"]
+    L --> U["docker compose -p my-backend-feature-x<br/>-f docker-compose.review.yml up -d<br/>IMAGE_TAG · REVIEW_HOST · SLUG"]
+    U --> T["🔀 Traefik<br/>Host(feature-x.review.example.com)"]
+    D([branch deleted · PR closed]) --> C["🧹 docker compose -p … down -v"]
+```
+
+1. Run Traefik once and point a wildcard record `*.review.example.com` at the server. See [`examples/traefik/docker-compose.traefik.yml`](examples/traefik/docker-compose.traefik.yml).
+2. Put a review compose file next to your app (default name `docker-compose.review.yml`). It must use `${IMAGE_TAG}`, `${REVIEW_HOST}` and `${SLUG}`. See [`examples/traefik/docker-compose.review.yml`](examples/traefik/docker-compose.review.yml). Each review app gets its own throwaway DB.
+3. Enable it in the caller and add the cleanup triggers:
+
+```yaml
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+  delete:
+  workflow_dispatch:
+    inputs:
+      rollback:
+        description: "Roll back to :previous"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write      # sticky coverage comment
+
+jobs:
+  pipeline:
+    uses: ppeymann/ci-templates/.github/workflows/django-docker.yml@v1
+    with:
+      image: my-backend
+      app-dir: ~/my-backend
+      services: web worker
+      health-url: http://127.0.0.1:8000/health
+      stage-app-dir: ~/my-backend-stage
+      review-enabled: true
+      review-domain: review.example.com
+      rollback: ${{ inputs.rollback || false }}
+    secrets:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_KEY: ${{ secrets.SSH_KEY }}
+```
+
+The slug is the lower-cased branch name (`feature/Login-UI` → `feature-login-ui`, max 30 chars) or `pr-<n>`. The compose project is `<image>-<slug>`.
+The health check calls Traefik on the server with `Host: <slug>.<review-domain>`. Migrations are **not** run for review apps; run them on container start
+(e.g. an entrypoint `migrate && gunicorn …`). Static sites: `review-enabled` rsyncs to `<remote-dir>-review/<slug>`, and your web server maps the wildcard host to that folder.
+
+### ↩️ Rollback (`:previous`)
+
+- **Automatic:** before the new image is tagged `:latest` (`:stage` for stage), the current one is saved as `:previous` (`:stage-previous`).
+  If migrate, restart or the health check fails, the job retags `:previous` → `:latest`, recreates the services and **fails** so you see it. Turn it off with `auto-rollback: false`.
+- **Manual:** run the workflow from **Actions → Run workflow** with `rollback: true` (caller example above). Build is skipped; the target comes from the ref you pick
+  (`main` → `dev`, `stage-branches` → `stage`, a `v*` tag → `production`). Only one step back is kept, so rolling back twice returns to the same image.
+
+### 📊 Coverage comment on pull requests
+
+Templates that produce coverage (go, django, fastapi, spring, dotnet, and their `-k8s` twins) post or update **one sticky comment** per PR with the total.
+The caller needs `permissions: pull-requests: write`. Without it, on fork PRs, or when there's no coverage file, the step is skipped or ignored and never fails the build.
+Turn it off with `pr-coverage-comment: false`. (node, nextjs, rust, laravel and swift-vapor don't produce a coverage total yet, so they never comment.)
+
+## 📱 App stores
+
+| Template | Store | Inputs | Secrets | When |
+|---|---|---|---|---|
+| `flutter.yml` | Google Play | `play-upload-enabled: true`, `play-package-name`, `play-track` (`internal` default · `alpha` · `beta` · `production`), `play-release-status` | `PLAY_SERVICE_ACCOUNT_JSON` (+ the optional keystore secrets so the AAB is signed with your upload key) | `v*` tags |
+| `ios-swiftui.yml` | TestFlight | `testflight-enabled: true` | App Store Connect API key + signing secrets | `v*` tags |
+| `ios-swiftui.yml` | App Store review | `testflight-enabled: true` **and** `appstore-submit: true`, `app-identifier`, `appstore-automatic-release` | same as TestFlight | `v*` tags |
+
+- **Play:** create a service account in Google Cloud and grant it *Release manager* in Play Console → Users and permissions. The **first** AAB must be uploaded by hand once.
+- **App Store:** after the TestFlight upload, `fastlane deliver` (preinstalled on macOS runners) picks the build by number (`GITHUB_RUN_NUMBER`), sets the version from the tag (`v1.4.0` → `1.4.0`, also written to `MARKETING_VERSION`) and submits it for review. It doesn't change metadata or screenshots, which stay in App Store Connect. It retries for up to 30 min while Apple processes the build.
+  Export compliance is declared as "no encryption". If your app uses custom encryption, submit from App Store Connect instead.
+- iOS upload is **not** in `flutter.yml`. Build Flutter iOS apps with `ios-swiftui.yml` pointed at `ios/Runner.xcworkspace` (scheme `Runner`) after `flutter build ios --config-only`.
+
 ## 📖 Inputs reference
 
 <details open>
@@ -722,17 +846,28 @@ base64 < stage-kubeconfig.yaml | tr -d '\n' | pbcopy   # KUBE_CONFIG_STAGE (opti
 
 | Input | Type | Default | Required | Description |
 |---|---|---|:-:|---|
-| `image` | string | – | ✅ | Docker image name, e.g. `referendum` |
-| `app-dir` | string | – | ✅ | Project dir on the server (holds `docker-compose.yml`) |
-| `service` | string | – | ✅ | Compose service to recreate |
-| `health-url` | string | – | ✅ | URL checked **from inside the server** (`curl -f`) |
-| `go-main` | string | `./cmd/app` | | Main package for release binaries |
-| `platform` | string | `linux/amd64` | | Image platform |
-| `deploy-branch` | string | `main` | | Branch that auto-deploys to `dev` |
-| `trivy-enabled` | boolean | `true` | | Scan the image with Trivy |
-| `trivy-fail` | boolean | `false` | | Fail on HIGH/CRITICAL vulnerabilities |
-| `release-enabled` | boolean | `true` | | Create a GitHub Release on `v*` tags |
-| `health-retries` | number | `20` | | Health check attempts (3 s apart) |
+| `image` | string | – | ✅ | Docker image name, e.g. referendum |
+| `app-dir` | string | – | ✅ | Project dir on server (has docker-compose.yml), e.g. ~/referendum |
+| `service` | string | – | ✅ | Compose service to restart, e.g. referendum-api |
+| `health-url` | string | – | ✅ | Health URL checked from inside the server |
+| `go-main` | string | `./cmd/app` |  | Main package for release binaries |
+| `platform` | string | `linux/amd64` |  | Image platform |
+| `deploy-branch` | string | `main` |  | Branch that auto-deploys |
+| `trivy-enabled` | boolean | `true` |  |  |
+| `trivy-fail` | boolean | `false` |  | Fail build on HIGH/CRITICAL vulnerabilities |
+| `release-enabled` | boolean | `true` |  |  |
+| `health-retries` | number | `20` |  |  |
+| `stage-branches` | string | `develop` |  | Regex of branches deployed to the `stage` environment (only if stage-app-dir is set) |
+| `stage-app-dir` | string | `""` |  | Project dir on server for STAGE (empty = stage disabled) |
+| `stage-service` | string | `""` |  | Compose service(s) for STAGE (empty = same as service) |
+| `stage-health-url` | string | `""` |  | Health URL for STAGE (empty = same as health-url) |
+| `review-enabled` | boolean | `false` |  | Deploy a review app per branch / same-repo PR (Traefik + wildcard DNS) |
+| `review-domain` | string | `""` |  | Review apps live at <slug>.<review-domain> |
+| `review-app-dir` | string | `""` |  | Dir on server holding the review compose file (empty = app-dir) |
+| `review-compose-file` | string | `docker-compose.review.yml` |  | Compose file for review apps (uses IMAGE_TAG, REVIEW_HOST, SLUG) |
+| `pr-coverage-comment` | boolean | `true` |  | Post a sticky coverage comment on pull requests (caller grants pull-requests: write) |
+| `auto-rollback` | boolean | `true` |  | On a failed deploy, retag :previous → :latest and recreate the services |
+| `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
 
 The `test` job starts **Postgres 17** and **Redis 8** and exports
 `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`, `REDIS_ADDR` for your tests.
@@ -743,19 +878,30 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports
 
 | Input | Type | Default | Required | Description |
 |---|---|---|:-:|---|
-| `image` | string | – | ✅ | Docker image name |
-| `app-dir` | string | – | ✅ | Project dir on the server |
-| `service` | string | – | ✅ | Compose service to recreate |
-| `health-url` | string | – | ✅ | URL checked from inside the server (200–499 = healthy) |
-| `node-version` | string | `22` | | Node.js version |
-| `platform` | string | `linux/amd64` | | Image platform |
-| `deploy-branch` | string | `main` | | Branch that auto-deploys |
-| `lint-enabled` | boolean | `true` | | `npm run lint --if-present` |
-| `typecheck-enabled` | boolean | `true` | | `npm run typecheck --if-present` |
-| `trivy-enabled` | boolean | `true` | | Scan the image with Trivy |
-| `trivy-fail` | boolean | `false` | | Fail on HIGH/CRITICAL vulnerabilities |
-| `release-enabled` | boolean | `true` | | GitHub Release on `v*` tags |
-| `health-retries` | number | `20` | | Health check attempts (3 s apart) |
+| `image` | string | – | ✅ | Docker image name, e.g. referendum-fe |
+| `app-dir` | string | – | ✅ | Project dir on server (has docker-compose.yml), e.g. ~/referendum-fe |
+| `service` | string | – | ✅ | Compose service to restart, e.g. referendum-fe |
+| `health-url` | string | – | ✅ | Health URL checked from inside the server |
+| `node-version` | string | `22` |  |  |
+| `platform` | string | `linux/amd64` |  |  |
+| `deploy-branch` | string | `main` |  |  |
+| `lint-enabled` | boolean | `true` |  |  |
+| `typecheck-enabled` | boolean | `true` |  |  |
+| `trivy-enabled` | boolean | `true` |  |  |
+| `trivy-fail` | boolean | `false` |  |  |
+| `release-enabled` | boolean | `true` |  |  |
+| `health-retries` | number | `20` |  |  |
+| `stage-branches` | string | `develop` |  | Regex of branches deployed to the `stage` environment (only if stage-app-dir is set) |
+| `stage-app-dir` | string | `""` |  | Project dir on server for STAGE (empty = stage disabled) |
+| `stage-service` | string | `""` |  | Compose service(s) for STAGE (empty = same as service) |
+| `stage-health-url` | string | `""` |  | Health URL for STAGE (empty = same as health-url) |
+| `review-enabled` | boolean | `false` |  | Deploy a review app per branch / same-repo PR (Traefik + wildcard DNS) |
+| `review-domain` | string | `""` |  | Review apps live at <slug>.<review-domain> |
+| `review-app-dir` | string | `""` |  | Dir on server holding the review compose file (empty = app-dir) |
+| `review-compose-file` | string | `docker-compose.review.yml` |  | Compose file for review apps (uses IMAGE_TAG, REVIEW_HOST, SLUG) |
+| `pr-coverage-comment` | boolean | `true` |  | Post a sticky coverage comment on pull requests (caller grants pull-requests: write) |
+| `auto-rollback` | boolean | `true` |  | On a failed deploy, retag :previous → :latest and recreate the services |
+| `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
 </details>
 
 <details>
@@ -763,26 +909,37 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports
 
 | Input | Type | Default | Required | Description |
 |---|---|---|:-:|---|
-| `image` | string | – | ✅ | Docker image name |
-| `app-dir` | string | – | ✅ | Project dir on the server (holds `docker-compose.yml`) |
-| `services` | string | – | ✅ | Compose services to recreate, space separated (`web celery celery-beat`) |
-| `health-url` | string | – | ✅ | URL checked from inside the server (200–499 = healthy) |
-| `migrate-service` | string | first of `services` | | Service used for `migrate` / `collectstatic` |
-| `working-directory` | string | `.` | | Folder with `manage.py` and `Dockerfile` |
-| `python-version` | string | `3.12` | | Python version in CI |
-| `install-command` | string | `pip install -r requirements.txt` | | Dependency install in CI |
-| `test-command` | string | `coverage run manage.py test` | | Test command (e.g. `coverage run -m pytest`) |
-| `test-env` | string | `""` | | Extra `KEY=VALUE` lines for the test job |
-| `manage-cmd` | string | `python manage.py` | | How `manage.py` is called inside the container |
-| `lint-enabled` | boolean | `true` | | `ruff check` + `ruff format --check`, only if a ruff config exists |
-| `migrate-enabled` | boolean | `true` | | Run `migrate --noinput` on deploy |
-| `collectstatic-enabled` | boolean | `true` | | Run `collectstatic --noinput` on deploy |
-| `platform` | string | `linux/amd64` | | Image platform |
-| `deploy-branch` | string | `main` | | Branch that auto-deploys |
-| `trivy-enabled` | boolean | `true` | | Scan the image with Trivy |
-| `trivy-fail` | boolean | `false` | | Fail on HIGH/CRITICAL vulnerabilities |
-| `release-enabled` | boolean | `true` | | GitHub Release on `v*` tags |
-| `health-retries` | number | `20` | | Health check attempts (3 s apart) |
+| `image` | string | – | ✅ | Docker image name, e.g. my-backend |
+| `app-dir` | string | – | ✅ | Project dir on server (has docker-compose.yml), e.g. ~/backend |
+| `services` | string | – | ✅ | Compose services to recreate, space separated, e.g. "web celery celery-beat\ |
+| `health-url` | string | – | ✅ | Health URL checked from inside the server (200-499 = healthy) |
+| `migrate-service` | string | `""` |  | Compose service used to run migrate/collectstatic (default: first of services) |
+| `working-directory` | string | `.` |  | Folder of the Django project inside the repo (has manage.py and Dockerfile) |
+| `python-version` | string | `3.12` |  |  |
+| `install-command` | string | `pip install -r requirements.txt` |  | Installs dependencies in CI |
+| `test-command` | string | `coverage run manage.py test` |  | Runs the tests (coverage is pre-installed) |
+| `test-env` | string | `""` |  | Extra KEY=VALUE lines for the test job (e.g. DJANGO_SETTINGS_MODULE=config.settings.test) |
+| `manage-cmd` | string | `python manage.py` |  | How manage.py is called inside the container |
+| `lint-enabled` | boolean | `true` |  | Run ruff (only if the project has a ruff config) |
+| `migrate-enabled` | boolean | `true` |  |  |
+| `collectstatic-enabled` | boolean | `true` |  |  |
+| `platform` | string | `linux/amd64` |  |  |
+| `deploy-branch` | string | `main` |  |  |
+| `trivy-enabled` | boolean | `true` |  |  |
+| `trivy-fail` | boolean | `false` |  | Fail build on HIGH/CRITICAL vulnerabilities |
+| `release-enabled` | boolean | `true` |  |  |
+| `health-retries` | number | `20` |  |  |
+| `stage-branches` | string | `develop` |  | Regex of branches deployed to the `stage` environment (only if stage-app-dir is set) |
+| `stage-app-dir` | string | `""` |  | Project dir on server for STAGE (empty = stage disabled) |
+| `stage-services` | string | `""` |  | Compose service(s) for STAGE (empty = same as services) |
+| `stage-health-url` | string | `""` |  | Health URL for STAGE (empty = same as health-url) |
+| `review-enabled` | boolean | `false` |  | Deploy a review app per branch / same-repo PR (Traefik + wildcard DNS) |
+| `review-domain` | string | `""` |  | Review apps live at <slug>.<review-domain> |
+| `review-app-dir` | string | `""` |  | Dir on server holding the review compose file (empty = app-dir) |
+| `review-compose-file` | string | `docker-compose.review.yml` |  | Compose file for review apps (uses IMAGE_TAG, REVIEW_HOST, SLUG) |
+| `pr-coverage-comment` | boolean | `true` |  | Post a sticky coverage comment on pull requests (caller grants pull-requests: write) |
+| `auto-rollback` | boolean | `true` |  | On a failed deploy, retag :previous → :latest and recreate the services |
+| `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
 
 The `test` job starts **Postgres 17** and **Redis 8** and exports common names so most settings files work as-is:
 `DATABASE_URL`, `DB_*`, `POSTGRES_*`, `REDIS_URL`, `CELERY_BROKER_URL`, `SECRET_KEY`, `DJANGO_SECRET_KEY` (dummy value), `DEBUG=False`.
@@ -812,6 +969,17 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `trivy-fail` | boolean | `false` |  | Fail build on HIGH/CRITICAL vulnerabilities |
 | `release-enabled` | boolean | `true` |  |  |
 | `health-retries` | number | `20` |  |  |
+| `stage-branches` | string | `develop` |  | Regex of branches deployed to the `stage` environment (only if stage-app-dir is set) |
+| `stage-app-dir` | string | `""` |  | Project dir on server for STAGE (empty = stage disabled) |
+| `stage-services` | string | `""` |  | Compose service(s) for STAGE (empty = same as services) |
+| `stage-health-url` | string | `""` |  | Health URL for STAGE (empty = same as health-url) |
+| `review-enabled` | boolean | `false` |  | Deploy a review app per branch / same-repo PR (Traefik + wildcard DNS) |
+| `review-domain` | string | `""` |  | Review apps live at <slug>.<review-domain> |
+| `review-app-dir` | string | `""` |  | Dir on server holding the review compose file (empty = app-dir) |
+| `review-compose-file` | string | `docker-compose.review.yml` |  | Compose file for review apps (uses IMAGE_TAG, REVIEW_HOST, SLUG) |
+| `pr-coverage-comment` | boolean | `true` |  | Post a sticky coverage comment on pull requests (caller grants pull-requests: write) |
+| `auto-rollback` | boolean | `true` |  | On a failed deploy, retag :previous → :latest and recreate the services |
+| `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
 </details>
 
 <details>
@@ -833,6 +1001,17 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `trivy-fail` | boolean | `false` |  | Fail build on HIGH/CRITICAL vulnerabilities |
 | `release-enabled` | boolean | `true` |  |  |
 | `health-retries` | number | `20` |  |  |
+| `stage-branches` | string | `develop` |  | Regex of branches deployed to the `stage` environment (only if stage-app-dir is set) |
+| `stage-app-dir` | string | `""` |  | Project dir on server for STAGE (empty = stage disabled) |
+| `stage-services` | string | `""` |  | Compose service(s) for STAGE (empty = same as services) |
+| `stage-health-url` | string | `""` |  | Health URL for STAGE (empty = same as health-url) |
+| `review-enabled` | boolean | `false` |  | Deploy a review app per branch / same-repo PR (Traefik + wildcard DNS) |
+| `review-domain` | string | `""` |  | Review apps live at <slug>.<review-domain> |
+| `review-app-dir` | string | `""` |  | Dir on server holding the review compose file (empty = app-dir) |
+| `review-compose-file` | string | `docker-compose.review.yml` |  | Compose file for review apps (uses IMAGE_TAG, REVIEW_HOST, SLUG) |
+| `pr-coverage-comment` | boolean | `true` |  | Post a sticky coverage comment on pull requests (caller grants pull-requests: write) |
+| `auto-rollback` | boolean | `true` |  | On a failed deploy, retag :previous → :latest and recreate the services |
+| `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
 </details>
 
 <details>
@@ -855,6 +1034,17 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `trivy-fail` | boolean | `false` |  | Fail build on HIGH/CRITICAL vulnerabilities |
 | `release-enabled` | boolean | `true` |  |  |
 | `health-retries` | number | `20` |  |  |
+| `stage-branches` | string | `develop` |  | Regex of branches deployed to the `stage` environment (only if stage-app-dir is set) |
+| `stage-app-dir` | string | `""` |  | Project dir on server for STAGE (empty = stage disabled) |
+| `stage-services` | string | `""` |  | Compose service(s) for STAGE (empty = same as services) |
+| `stage-health-url` | string | `""` |  | Health URL for STAGE (empty = same as health-url) |
+| `review-enabled` | boolean | `false` |  | Deploy a review app per branch / same-repo PR (Traefik + wildcard DNS) |
+| `review-domain` | string | `""` |  | Review apps live at <slug>.<review-domain> |
+| `review-app-dir` | string | `""` |  | Dir on server holding the review compose file (empty = app-dir) |
+| `review-compose-file` | string | `docker-compose.review.yml` |  | Compose file for review apps (uses IMAGE_TAG, REVIEW_HOST, SLUG) |
+| `pr-coverage-comment` | boolean | `true` |  | Post a sticky coverage comment on pull requests (caller grants pull-requests: write) |
+| `auto-rollback` | boolean | `true` |  | On a failed deploy, retag :previous → :latest and recreate the services |
+| `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
 </details>
 
 <details>
@@ -877,6 +1067,17 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `trivy-fail` | boolean | `false` |  | Fail build on HIGH/CRITICAL vulnerabilities |
 | `release-enabled` | boolean | `true` |  |  |
 | `health-retries` | number | `20` |  |  |
+| `stage-branches` | string | `develop` |  | Regex of branches deployed to the `stage` environment (only if stage-app-dir is set) |
+| `stage-app-dir` | string | `""` |  | Project dir on server for STAGE (empty = stage disabled) |
+| `stage-services` | string | `""` |  | Compose service(s) for STAGE (empty = same as services) |
+| `stage-health-url` | string | `""` |  | Health URL for STAGE (empty = same as health-url) |
+| `review-enabled` | boolean | `false` |  | Deploy a review app per branch / same-repo PR (Traefik + wildcard DNS) |
+| `review-domain` | string | `""` |  | Review apps live at <slug>.<review-domain> |
+| `review-app-dir` | string | `""` |  | Dir on server holding the review compose file (empty = app-dir) |
+| `review-compose-file` | string | `docker-compose.review.yml` |  | Compose file for review apps (uses IMAGE_TAG, REVIEW_HOST, SLUG) |
+| `pr-coverage-comment` | boolean | `true` |  | Post a sticky coverage comment on pull requests (caller grants pull-requests: write) |
+| `auto-rollback` | boolean | `true` |  | On a failed deploy, retag :previous → :latest and recreate the services |
+| `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
 </details>
 
 <details>
@@ -897,6 +1098,17 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `trivy-fail` | boolean | `false` |  | Fail build on HIGH/CRITICAL vulnerabilities |
 | `release-enabled` | boolean | `true` |  |  |
 | `health-retries` | number | `20` |  |  |
+| `stage-branches` | string | `develop` |  | Regex of branches deployed to the `stage` environment (only if stage-app-dir is set) |
+| `stage-app-dir` | string | `""` |  | Project dir on server for STAGE (empty = stage disabled) |
+| `stage-services` | string | `""` |  | Compose service(s) for STAGE (empty = same as services) |
+| `stage-health-url` | string | `""` |  | Health URL for STAGE (empty = same as health-url) |
+| `review-enabled` | boolean | `false` |  | Deploy a review app per branch / same-repo PR (Traefik + wildcard DNS) |
+| `review-domain` | string | `""` |  | Review apps live at <slug>.<review-domain> |
+| `review-app-dir` | string | `""` |  | Dir on server holding the review compose file (empty = app-dir) |
+| `review-compose-file` | string | `docker-compose.review.yml` |  | Compose file for review apps (uses IMAGE_TAG, REVIEW_HOST, SLUG) |
+| `pr-coverage-comment` | boolean | `true` |  | Post a sticky coverage comment on pull requests (caller grants pull-requests: write) |
+| `auto-rollback` | boolean | `true` |  | On a failed deploy, retag :previous → :latest and recreate the services |
+| `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
 </details>
 
 <details>
@@ -921,6 +1133,17 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `trivy-fail` | boolean | `false` |  | Fail build on HIGH/CRITICAL vulnerabilities |
 | `release-enabled` | boolean | `true` |  |  |
 | `health-retries` | number | `20` |  |  |
+| `stage-branches` | string | `develop` |  | Regex of branches deployed to the `stage` environment (only if stage-app-dir is set) |
+| `stage-app-dir` | string | `""` |  | Project dir on server for STAGE (empty = stage disabled) |
+| `stage-services` | string | `""` |  | Compose service(s) for STAGE (empty = same as services) |
+| `stage-health-url` | string | `""` |  | Health URL for STAGE (empty = same as health-url) |
+| `review-enabled` | boolean | `false` |  | Deploy a review app per branch / same-repo PR (Traefik + wildcard DNS) |
+| `review-domain` | string | `""` |  | Review apps live at <slug>.<review-domain> |
+| `review-app-dir` | string | `""` |  | Dir on server holding the review compose file (empty = app-dir) |
+| `review-compose-file` | string | `docker-compose.review.yml` |  | Compose file for review apps (uses IMAGE_TAG, REVIEW_HOST, SLUG) |
+| `pr-coverage-comment` | boolean | `true` |  | Post a sticky coverage comment on pull requests (caller grants pull-requests: write) |
+| `auto-rollback` | boolean | `true` |  | On a failed deploy, retag :previous → :latest and recreate the services |
+| `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
 </details>
 
 <details>
@@ -941,6 +1164,17 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `trivy-fail` | boolean | `false` |  | Fail build on HIGH/CRITICAL vulnerabilities |
 | `release-enabled` | boolean | `true` |  |  |
 | `health-retries` | number | `20` |  |  |
+| `stage-branches` | string | `develop` |  | Regex of branches deployed to the `stage` environment (only if stage-app-dir is set) |
+| `stage-app-dir` | string | `""` |  | Project dir on server for STAGE (empty = stage disabled) |
+| `stage-services` | string | `""` |  | Compose service(s) for STAGE (empty = same as services) |
+| `stage-health-url` | string | `""` |  | Health URL for STAGE (empty = same as health-url) |
+| `review-enabled` | boolean | `false` |  | Deploy a review app per branch / same-repo PR (Traefik + wildcard DNS) |
+| `review-domain` | string | `""` |  | Review apps live at <slug>.<review-domain> |
+| `review-app-dir` | string | `""` |  | Dir on server holding the review compose file (empty = app-dir) |
+| `review-compose-file` | string | `docker-compose.review.yml` |  | Compose file for review apps (uses IMAGE_TAG, REVIEW_HOST, SLUG) |
+| `pr-coverage-comment` | boolean | `true` |  | Post a sticky coverage comment on pull requests (caller grants pull-requests: write) |
+| `auto-rollback` | boolean | `true` |  | On a failed deploy, retag :previous → :latest and recreate the services |
+| `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
 </details>
 
 <details>
@@ -997,6 +1231,9 @@ Every `*-k8s.yml` takes its Docker twin's inputs **minus** `app-dir`, `service(s
 | `test-enabled` | boolean | `true` |  |  |
 | `lint-enabled` | boolean | `true` |  | Run SwiftLint (only if .swiftlint.yml exists) |
 | `testflight-enabled` | boolean | `false` |  | On v* tags: archive, export IPA and upload to TestFlight |
+| `appstore-submit` | boolean | `false` |  | On v* tags, after the TestFlight upload, submit the build for App Store review (fastlane deliver) |
+| `app-identifier` | string | `""` |  | Bundle ID, needed for appstore-submit, e.g. com.example.myapp |
+| `appstore-automatic-release` | boolean | `false` |  | Release automatically once Apple approves |
 | `export-method` | string | `app-store-connect` |  | app-store-connect \| release-testing \| debugging |
 | `release-enabled` | boolean | `true` |  | Create a GitHub release on v* tags (attaches IPA if built) |
 </details>
@@ -1015,6 +1252,10 @@ Every `*-k8s.yml` takes its Docker twin's inputs **minus** `app-dir`, `service(s
 | `build-args` | string | `""` |  | Extra flutter build args, e.g. --flavor prod --dart-define=API=https://... |
 | `deploy-branch` | string | `main` |  |  |
 | `release-enabled` | boolean | `true` |  |  |
+| `play-upload-enabled` | boolean | `false` |  | On v* tags, upload the AAB to Google Play (needs PLAY_SERVICE_ACCOUNT_JSON) |
+| `play-package-name` | string | `""` |  | Android applicationId, e.g. com.example.myapp |
+| `play-track` | string | `internal` |  | internal \| alpha \| beta \| production |
+| `play-release-status` | string | `completed` |  | completed \| draft \| inProgress |
 </details>
 
 <details>
@@ -1022,14 +1263,20 @@ Every `*-k8s.yml` takes its Docker twin's inputs **minus** `app-dir`, `service(s
 
 | Input | Type | Default | Required | Description |
 |---|---|---|:-:|---|
-| `remote-dir` | string | – | ✅ | Server folder that receives the build output |
-| `health-url` | string | – | ✅ | URL checked from inside the server |
-| `node-version` | string | `22` | | Node.js version |
-| `build-command` | string | `npm run build` | | Build command |
-| `out-dir` | string | `out` | | Build output folder |
-| `build-env` | string | `""` | | `KEY=VALUE` lines added to the build environment |
-| `lint-enabled` | boolean | `true` | | `npm run lint --if-present` |
-| `deploy-branch` | string | `main` | | Branch that deploys |
+| `remote-dir` | string | – | ✅ | Path on the server where the build output goes |
+| `health-url` | string | – | ✅ | URL checked on the server after deploy |
+| `node-version` | string | `22` |  |  |
+| `build-command` | string | `npm run build` |  |  |
+| `out-dir` | string | `out` |  |  |
+| `build-env` | string | `""` |  | KEY=VALUE lines added to the build environment |
+| `lint-enabled` | boolean | `true` |  |  |
+| `deploy-branch` | string | `main` |  |  |
+| `stage-branches` | string | `develop` |  | Regex of branches deployed to the `stage` environment (only if stage-remote-dir is set) |
+| `stage-remote-dir` | string | `""` |  | Server path for STAGE (empty = stage disabled) |
+| `stage-health-url` | string | `""` |  | Health URL for STAGE (empty = same as health-url) |
+| `stage-build-env` | string | `""` |  | Extra KEY=VALUE build env for STAGE builds (added after build-env) |
+| `review-enabled` | boolean | `false` |  | rsync each branch / same-repo PR build to <remote-dir>-review/<slug> |
+| `review-domain` | string | `""` |  | Shown as the review URL: https://<slug>.<review-domain> (your web server maps it) |
 </details>
 
 ## 🔐 Secrets & variables
@@ -1049,6 +1296,8 @@ Set them in **Settings → Secrets and variables → Actions** of each project r
 | `APP_STORE_CONNECT_KEY_ID` / `_ISSUER_ID` / `_KEY_P8` | Secret (optional) | App Store Connect API key | ios-swiftui (TestFlight) |
 | `BUILD_CERTIFICATE_P12` / `P12_PASSWORD` | Secret (optional) | `base64` Apple Distribution `.p12` + password | ios-swiftui (TestFlight) |
 | `PROVISIONING_PROFILE` / `APPLE_TEAM_ID` | Secret (optional) | `base64` `.mobileprovision`, team ID | ios-swiftui (TestFlight) |
+| `PLAY_SERVICE_ACCOUNT_JSON` | Secret (optional) | Google Play service-account JSON | flutter (`play-upload-enabled`) |
+| `GITHUB_TOKEN` + `pull-requests: write` | automatic / caller permission | – | sticky PR coverage comment |
 | `ANDROID_KEYSTORE` (+ `_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`) | Secret (optional) | `base64` upload keystore | flutter |
 | `NEXT_PUBLIC_*` | Variable | `https://api.example.com` | static-site (via `build-env`) |
 
@@ -1094,12 +1343,13 @@ sequenceDiagram
     participant S as Server
     participant C as docker compose
 
-    GH->>GH: docker buildx build → image:VERSION + :latest
+    GH->>GH: docker buildx build → image:VERSION
     GH->>GH: trivy scan (CRITICAL, HIGH)
     GH->>GH: docker save | gzip → artifact
     GH->>S: ssh (deploy key)
     GH->>S: gunzip | docker load
-    GH->>C: up -d --no-build --force-recreate service
+    GH->>S: tag :latest → :previous, :VERSION → :latest (stage: :stage)
+    GH->>C: (migrate) · up -d --no-build --force-recreate services
     loop up to health-retries × 3 s
         GH->>S: curl health-url
     end
@@ -1107,12 +1357,13 @@ sequenceDiagram
         S-->>GH: 2xx ✅ (summary: Deployed image:VERSION)
     else not healthy
         S-->>GH: ❌ + last 50 log lines
+        GH->>C: retag :previous → :latest · up -d (auto rollback)
     end
     GH->>S: docker image prune -f
 ```
 
 **Versions:** a `v*` tag becomes the image tag (`v1.2.0`); everything else becomes `sha-<7 chars>`.
-`concurrency: deploy-<image>` makes sure two deploys of the same app never overlap.
+`concurrency: deploy-<image>-<environment>` makes sure two deploys of the same app and environment never overlap.
 
 ## 🏷 Versioning the templates
 
@@ -1151,17 +1402,16 @@ git tag -f v1 && git push origin v1 --force
 | Spring: `mvnw: Permission denied` | Wrapper not executable in git | Handled by the template (`chmod +x`); also run `git update-index --chmod=+x mvnw` |
 | iOS: `Unable to find a destination` | Simulator name not on the runner's Xcode | Set `destination` (e.g. `platform=iOS Simulator,name=iPhone 15`) or pin `xcode-version` |
 | iOS TestFlight: `No signing certificate` | Missing/invalid `BUILD_CERTIFICATE_P12` / profile | Re-export the `.p12` and profile, `base64` them into the secrets |
+| Stage deploy never happens | `stage-app-dir` empty, or branch doesn't match `stage-branches` | Set both; the regex is anchored (`develop\|release/.*`) |
+| Stage starts the dev version | Stage compose file uses `:latest` | Use `image: <image>:stage` in the stage compose file |
+| Review app 404 / no TLS | Wildcard DNS missing, container not on Traefik's `web` network, or wrong labels | `dig x.review.example.com`; compare with `examples/traefik`; `docker logs traefik` |
+| Review app left running | Caller lacks `delete` / `pull_request: closed` triggers | Add them, or `docker compose -p <image>-<slug> -f docker-compose.review.yml down -v` |
+| No coverage comment on PR | Caller lacks `pull-requests: write`, fork PR, or no coverage file | Add the permission; forks are skipped on purpose |
+| `Rolled back to :previous` in summary | New version failed health check or migration | Read the logs above it, fix, push again |
+| Manual rollback: `no <image>:previous` | First deploy, or `docker image prune -a` removed it | Redeploy an older tag/commit instead |
+| Play upload: `Package not found` / `APK specifies a version code that has already been used` | First upload not done by hand, or reused build number | Upload once manually; build numbers come from `GITHUB_RUN_NUMBER` |
+| App Store submit keeps retrying | Build still processing, or version already submitted | Wait / re-run the job; check App Store Connect |
 | Static build has no API data | Backend unreachable at build time | Make sure the `NEXT_PUBLIC_*` URL answers from GitHub runners |
-
-## 🗺 Roadmap
-
-- [ ] `stage` environment for the `develop` branch
-- [ ] Review apps per branch (Traefik + wildcard DNS)
-- [x] Push images to GHCR (`*-k8s.yml`)
-- [ ] Coverage report on pull requests
-- [x] Automatic rollback (`kubectl rollout undo` / `helm --atomic`) in k8s templates
-- [ ] Rollback job for the Docker templates (`image:previous`)
-- [ ] Android Play Store / iOS App Store production upload
 
 ---
 

@@ -32,7 +32,26 @@ on:
       release-enabled:
         type: boolean
         default: true
+      play-upload-enabled:
+        description: "On v* tags, upload the AAB to Google Play (needs PLAY_SERVICE_ACCOUNT_JSON)"
+        type: boolean
+        default: false
+      play-package-name:
+        description: "Android applicationId, e.g. com.example.myapp"
+        type: string
+        default: ""
+      play-track:
+        description: "internal | alpha | beta | production"
+        type: string
+        default: internal
+      play-release-status:
+        description: "completed | draft | inProgress"
+        type: string
+        default: completed
     secrets:
+      PLAY_SERVICE_ACCOUNT_JSON:
+        description: "Google Play service-account JSON (plain text)"
+        required: false
       ANDROID_KEYSTORE:
         description: "base64 of upload keystore (.jks); unsigned/debug-signed build if missing"
         required: false
@@ -185,6 +204,37 @@ jobs:
           name: android
           path: dist/*
           retention-days: 7
+
+  # ───────────── Google Play (tags, opt-in) ─────────────
+  play:
+    needs: [prepare, build]
+    if: inputs.play-upload-enabled && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: android
+          path: dist
+
+      - name: Check inputs
+        env:
+          SA: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          [ -n "$SA" ] || { echo "::error::PLAY_SERVICE_ACCOUNT_JSON secret is required"; exit 1; }
+          [ -n "${{ inputs.play-package-name }}" ] || { echo "::error::play-package-name is required"; exit 1; }
+          ls dist/*.aab >/dev/null || { echo "::error::no .aab built (build-aab: true)"; exit 1; }
+
+      - uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: ${{ inputs.play-package-name }}
+          releaseFiles: dist/*.aab
+          track: ${{ inputs.play-track }}
+          status: ${{ inputs.play-release-status }}
+
+      - name: Summary
+        run: echo "### 🤖 Uploaded ${{ needs.prepare.outputs.version }} to Google Play (${{ inputs.play-track }})" >> "$GITHUB_STEP_SUMMARY"
 
   # ───────────── release (tags only) ─────────────
   release:

@@ -162,6 +162,10 @@ on:
       rollout-timeout:
         type: string
         default: 5m
+      pr-coverage-comment:
+        description: "Post a sticky coverage comment on pull requests (caller grants pull-requests: write)"
+        type: boolean
+        default: true
     secrets:
       KUBE_CONFIG_PROD:
         description: "base64 kubeconfig for PROD"
@@ -327,6 +331,7 @@ jobs:
             TOTAL=$(awk -F, 'NR>1 {m+=$8; c+=$9} END {if (m+c>0) printf "%.1f%% lines", 100*c/(m+c)}' "$CSV")
             echo "$TOTAL"
             echo "### Coverage: \`$TOTAL\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "COVERAGE_TOTAL=$TOTAL" >> "$GITHUB_ENV"
           else
             echo "no JaCoCo report found"
           fi
@@ -422,6 +427,17 @@ jobs:
             echo "replicas=$REPLICAS"
           } >> "$GITHUB_OUTPUT"
           echo "### Target: \`$ENV\` → \`$NS/$NAME\` ${URL}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Coverage comment on PR
+        if: always() && inputs.pr-coverage-comment && github.event_name == 'pull_request' && env.COVERAGE_TOTAL != '' && github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: coverage-${{ github.workflow }}
+          message: |
+            ### 🧪 Coverage
+            **${{ env.COVERAGE_TOTAL }}** for ${{ github.event.pull_request.head.sha }}
+            <sub>posted by ci-templates · run #${{ github.run_number }}</sub>
 
   # ───────────── 3. build + push ─────────────
   build:

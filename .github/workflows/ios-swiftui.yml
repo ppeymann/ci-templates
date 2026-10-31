@@ -36,6 +36,18 @@ on:
         description: "On v* tags: archive, export IPA and upload to TestFlight"
         type: boolean
         default: false
+      appstore-submit:
+        description: "On v* tags, after the TestFlight upload, submit the build for App Store review (fastlane deliver)"
+        type: boolean
+        default: false
+      app-identifier:
+        description: "Bundle ID, needed for appstore-submit, e.g. com.example.myapp"
+        type: string
+        default: ""
+      appstore-automatic-release:
+        description: "Release automatically once Apple approves"
+        type: boolean
+        default: false
       export-method:
         description: "app-store-connect | release-testing | debugging"
         type: string
@@ -207,6 +219,7 @@ jobs:
             -destination "generic/platform=iOS" \
             -archivePath "$RUNNER_TEMP/app.xcarchive" \
             CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            MARKETING_VERSION="${VERSION#v}" \
             archive -quiet
 
       - name: Export IPA
@@ -235,6 +248,38 @@ jobs:
           IPA=$(find "$GITHUB_WORKSPACE/dist" -name '*.ipa' | head -1)
           xcrun altool --upload-app -t ios -f "$IPA" --apiKey "$KEY_ID" --apiIssuer "$ISSUER_ID"
           echo "### Uploaded \`$VERSION\` to TestFlight 🚀" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Submit for App Store review
+        if: inputs.appstore-submit
+        env:
+          KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          KEY_P8: ${{ secrets.APP_STORE_CONNECT_KEY_P8 }}
+        run: |
+          [ -n "${{ inputs.app-identifier }}" ] || { echo "::error::app-identifier is required for appstore-submit"; exit 1; }
+          jq -n --arg k "$KEY_ID" --arg i "$ISSUER_ID" --arg p "$KEY_P8" \
+            '{key_id: $k, issuer_id: $i, key: $p, in_house: false}' > "$RUNNER_TEMP/asc.json"
+          command -v fastlane >/dev/null || brew install fastlane
+          APP_VERSION="${VERSION#v}"
+          # Apple needs a few minutes to process the upload; deliver selects the build by number.
+          for i in 1 2 3 4 5 6; do
+            if fastlane deliver \
+                --api_key_path "$RUNNER_TEMP/asc.json" \
+                --app_identifier "${{ inputs.app-identifier }}" \
+                --app_version "$APP_VERSION" \
+                --build_number "$GITHUB_RUN_NUMBER" \
+                --skip_binary_upload true --skip_screenshots true --skip_metadata true \
+                --submit_for_review true \
+                --automatic_release "${{ inputs.appstore-automatic-release }}" \
+                --run_precheck_before_submit false --force true \
+                --submission_information '{"export_compliance_uses_encryption": false, "add_id_info_uses_idfa": false}'; then
+              echo "### 🍏 Submitted $APP_VERSION ($GITHUB_RUN_NUMBER) for App Store review" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "build not ready yet, retrying in 5 min ($i/6)"
+            sleep 300
+          done
+          exit 1
 
       - uses: actions/upload-artifact@v4
         with:

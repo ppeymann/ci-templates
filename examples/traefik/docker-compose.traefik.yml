@@ -1,0 +1,29 @@
+# Traefik for review apps: run once on the server.
+#   docker network create web
+#   docker compose -f docker-compose.traefik.yml up -d
+# DNS: *.review.example.com  A  <server IP>
+services:
+  traefik:
+    image: traefik:v3.3
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=web
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --certificatesresolvers.le.acme.email=admin@example.com
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./letsencrypt:/letsencrypt
+    networks: [web]
+
+networks:
+  web:
+    external: true

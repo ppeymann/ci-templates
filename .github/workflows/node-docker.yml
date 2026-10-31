@@ -55,6 +55,50 @@ on:
       health-retries:
         type: number
         default: 20
+      stage-branches:
+        description: "Regex of branches deployed to the `stage` environment (only if stage-app-dir is set)"
+        type: string
+        default: develop
+      stage-app-dir:
+        description: "Project dir on server for STAGE (empty = stage disabled)"
+        type: string
+        default: ""
+      stage-services:
+        description: "Compose service(s) for STAGE (empty = same as services)"
+        type: string
+        default: ""
+      stage-health-url:
+        description: "Health URL for STAGE (empty = same as health-url)"
+        type: string
+        default: ""
+      review-enabled:
+        description: "Deploy a review app per branch / same-repo PR (Traefik + wildcard DNS)"
+        type: boolean
+        default: false
+      review-domain:
+        description: "Review apps live at <slug>.<review-domain>"
+        type: string
+        default: ""
+      review-app-dir:
+        description: "Dir on server holding the review compose file (empty = app-dir)"
+        type: string
+        default: ""
+      review-compose-file:
+        description: "Compose file for review apps (uses IMAGE_TAG, REVIEW_HOST, SLUG)"
+        type: string
+        default: docker-compose.review.yml
+      pr-coverage-comment:
+        description: "Post a sticky coverage comment on pull requests (caller grants pull-requests: write)"
+        type: boolean
+        default: true
+      auto-rollback:
+        description: "On a failed deploy, retag :previous → :latest and recreate the services"
+        type: boolean
+        default: true
+      rollback:
+        description: "Manual rollback: skip build, restore :previous (use with workflow_dispatch)"
+        type: boolean
+        default: false
     secrets:
       SSH_HOST:
         required: true
@@ -72,10 +116,13 @@ defaults:
 jobs:
   # ───────────── 1. prepare ─────────────
   prepare:
+    if: ${{ !inputs.rollback && !(github.event_name == 'delete' || (github.event_name == 'pull_request' && github.event.action == 'closed')) }}
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.meta.outputs.version }}
       deploy: ${{ steps.meta.outputs.deploy }}
+      target: ${{ steps.meta.outputs.target }}
+      slug: ${{ steps.meta.outputs.slug }}
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
@@ -84,17 +131,39 @@ jobs:
 
       - name: Version and deploy decision
         id: meta
+        env:
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          STAGE_RE: ${{ inputs.stage-branches }}
         run: |
+          slugify() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-30 | sed -E 's/-+$//'; }
+          TARGET=none
+          SLUG=""
+          VERSION="sha-${GITHUB_SHA::7}"
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            echo "version=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
-            echo "deploy=true" >> "$GITHUB_OUTPUT"
-          elif [[ "$GITHUB_EVENT_NAME" != "pull_request" && "$GITHUB_REF_NAME" == "${{ inputs.deploy-branch }}" ]]; then
-            echo "version=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-            echo "deploy=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "version=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            TARGET=production
+            VERSION="$GITHUB_REF_NAME"
+          elif [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            if [ "${{ inputs.review-enabled }}" = true ] && [ "$HEAD_REPO" = "$GITHUB_REPOSITORY" ]; then
+              TARGET=review
+              SLUG="pr-$PR_NUMBER"
+            fi
+          elif [[ "$GITHUB_REF" == refs/heads/* ]]; then
+            if [ "$GITHUB_REF_NAME" = "${{ inputs.deploy-branch }}" ]; then
+              TARGET=dev
+            elif [ -n "${{ inputs.stage-app-dir }}" ] && [ -n "$STAGE_RE" ] && [[ "$GITHUB_REF_NAME" =~ ^($STAGE_RE)$ ]]; then
+              TARGET=stage
+            elif [ "${{ inputs.review-enabled }}" = true ] && [ "$GITHUB_EVENT_NAME" = push ]; then
+              TARGET=review
+              SLUG=$(slugify "$GITHUB_REF_NAME")
+            fi
           fi
+          DEPLOY=false
+          [ "$TARGET" != none ] && DEPLOY=true
+          {
+            echo "version=$VERSION"; echo "deploy=$DEPLOY"; echo "target=$TARGET"; echo "slug=$SLUG"
+          } >> "$GITHUB_OUTPUT"
+          echo "### Target: \`$TARGET\` ($VERSION)" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/setup-node@v4
         with:
@@ -224,7 +293,6 @@ jobs:
           docker buildx build \
             --platform ${{ inputs.platform }} \
             -t "$IMAGE:$VERSION" \
-            -t "$IMAGE:latest" \
             --load ${{ inputs.working-directory }}
 
       - name: Scan image (trivy)
@@ -237,7 +305,7 @@ jobs:
           exit-code: ${{ inputs.trivy-fail && '1' || '0' }}
 
       - name: Save image
-        run: docker save "$IMAGE:$VERSION" "$IMAGE:latest" | gzip > image.tar.gz
+        run: docker save "$IMAGE:$VERSION" | gzip > image.tar.gz
 
       - uses: actions/upload-artifact@v4
         with:
@@ -245,13 +313,14 @@ jobs:
           path: image.tar.gz
           retention-days: 3
 
-  # ───────────── 4. deploy ─────────────
+  # ───────────── 4. deploy (dev / stage / production) ─────────────
   deploy:
     needs: [prepare, build]
+    if: needs.prepare.outputs.target == 'dev' || needs.prepare.outputs.target == 'stage' || needs.prepare.outputs.target == 'production'
     runs-on: ubuntu-latest
-    environment: ${{ startsWith(github.ref, 'refs/tags/v') && 'production' || 'dev' }}
+    environment: ${{ needs.prepare.outputs.target }}
     concurrency:
-      group: deploy-${{ inputs.image }}
+      group: deploy-${{ inputs.image }}-${{ needs.prepare.outputs.target }}
       cancel-in-progress: false
     env:
       IMAGE: ${{ inputs.image }}
@@ -259,8 +328,11 @@ jobs:
       SSH_HOST: ${{ secrets.SSH_HOST }}
       SSH_PORT: ${{ secrets.SSH_PORT }}
       SSH_USER: ${{ secrets.SSH_USER }}
-      APP_DIR: ${{ inputs.app-dir }}
-      SERVICES: ${{ inputs.services }}
+      APP_DIR: ${{ needs.prepare.outputs.target == 'stage' && inputs.stage-app-dir || inputs.app-dir }}
+      SERVICES: ${{ needs.prepare.outputs.target == 'stage' && inputs.stage-services != '' && inputs.stage-services || inputs.services }}
+      HEALTH_URL: ${{ needs.prepare.outputs.target == 'stage' && inputs.stage-health-url || inputs.health-url }}
+      CHAN: ${{ needs.prepare.outputs.target == 'stage' && 'stage' || 'latest' }}
+      PREV: ${{ needs.prepare.outputs.target == 'stage' && 'stage-previous' || 'previous' }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -287,16 +359,22 @@ jobs:
       - name: Ship image
         run: gunzip -c image.tar.gz | ssh server 'docker load'
 
+      - name: Keep previous + move tag
+        run: |
+          ssh server "docker image inspect $IMAGE:$CHAN >/dev/null 2>&1 && docker tag $IMAGE:$CHAN $IMAGE:$PREV || echo 'no current image, first deploy'"
+          ssh server "docker tag $IMAGE:$VERSION $IMAGE:$CHAN"
+          echo "MOVED=1" >> "$GITHUB_ENV"
+
       - name: Restart services
         run: ssh server "cd $APP_DIR && docker compose up -d --no-build --force-recreate $SERVICES"
 
       - name: Health check
         run: |
           for i in $(seq 1 ${{ inputs.health-retries }}); do
-            CODE=$(ssh server "curl -s -o /dev/null -w '%{http_code}' ${{ inputs.health-url }}" || echo 000)
+            CODE=$(ssh server "curl -s -o /dev/null -w '%{http_code}' $HEALTH_URL" || echo 000)
             if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 500 ]; then
               echo "healthy ✅ ($VERSION, HTTP $CODE)"
-              echo "### Deployed \`$IMAGE:$VERSION\` ✅" >> "$GITHUB_STEP_SUMMARY"
+              echo "### Deployed \`$IMAGE:$VERSION\` to ${{ needs.prepare.outputs.target }} ✅" >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
             echo "waiting... ($i, HTTP $CODE)"
@@ -306,9 +384,212 @@ jobs:
           ssh server "cd $APP_DIR && docker compose logs --tail 50 $SERVICES"
           exit 1
 
+      - name: Auto rollback to :previous
+        if: failure() && inputs.auto-rollback && env.MOVED == '1'
+        run: |
+          if ssh server "docker image inspect $IMAGE:$PREV" >/dev/null 2>&1; then
+            ssh server "docker tag $IMAGE:$PREV $IMAGE:$CHAN && cd $APP_DIR && docker compose up -d --no-build --force-recreate $SERVICES"
+            echo "### ↩️ Rolled back \`$IMAGE\` to :$PREV" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "no :$PREV image to roll back to"
+          fi
+
       - name: Cleanup old images
         if: always()
         run: ssh server 'docker image prune -f' || true
+
+  # ───────────── 4b. review app (Traefik) ─────────────
+  review:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.target == 'review'
+    runs-on: ubuntu-latest
+    environment:
+      name: review/${{ needs.prepare.outputs.slug }}
+      url: https://${{ needs.prepare.outputs.slug }}.${{ inputs.review-domain }}
+    concurrency:
+      group: review-${{ inputs.image }}-${{ needs.prepare.outputs.slug }}
+      cancel-in-progress: true
+    env:
+      IMAGE: ${{ inputs.image }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SLUG: ${{ needs.prepare.outputs.slug }}
+      PROJECT: ${{ inputs.image }}-${{ needs.prepare.outputs.slug }}
+      REVIEW_HOST: ${{ needs.prepare.outputs.slug }}.${{ inputs.review-domain }}
+      REVIEW_DIR: ${{ inputs.review-app-dir != '' && inputs.review-app-dir || inputs.app-dir }}
+      REVIEW_FILE: ${{ inputs.review-compose-file }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts
+          cat >> ~/.ssh/config <<EOF
+          Host server
+            HostName $SSH_HOST
+            Port $SSH_PORT
+            User $SSH_USER
+            IdentityFile ~/.ssh/id_ed25519
+            ServerAliveInterval 30
+          EOF
+
+      - name: Test SSH connection
+        run: ssh server 'echo "connected as $(whoami) on $(hostname)"'
+
+      - name: Ship image
+        run: gunzip -c image.tar.gz | ssh server 'docker load'
+
+      - name: Start review app
+        run: |
+          ssh server "cd $REVIEW_DIR && IMAGE_TAG=$VERSION REVIEW_HOST=$REVIEW_HOST SLUG=$SLUG \
+            docker compose -p $PROJECT -f $REVIEW_FILE up -d --no-build --force-recreate --remove-orphans"
+
+      - name: Health check (via Traefik)
+        run: |
+          for i in $(seq 1 ${{ inputs.health-retries }}); do
+            CODE=$(ssh server "curl -s -o /dev/null -w '%{http_code}' -H 'Host: $REVIEW_HOST' http://127.0.0.1/" || echo 000)
+            if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 500 ]; then
+              echo "healthy ✅ ($REVIEW_HOST, HTTP $CODE)"
+              echo "### Review app https://$REVIEW_HOST ✅" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "waiting... ($i, HTTP $CODE)"
+            sleep 3
+          done
+          echo "service did not become healthy ❌"
+          ssh server "cd $REVIEW_DIR && IMAGE_TAG=$VERSION REVIEW_HOST=$REVIEW_HOST SLUG=$SLUG docker compose -p $PROJECT -f $REVIEW_FILE logs --tail 50"
+          exit 1
+
+  # ───────────── cleanup review app (branch deleted / PR closed) ─────────────
+  cleanup:
+    if: inputs.review-enabled && (github.event_name == 'delete' || (github.event_name == 'pull_request' && github.event.action == 'closed'))
+    runs-on: ubuntu-latest
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      DELETED_REF: ${{ github.event.ref }}
+      REF_TYPE: ${{ github.event.ref_type }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      REVIEW_DIR: ${{ inputs.review-app-dir != '' && inputs.review-app-dir || inputs.app-dir }}
+      REVIEW_FILE: ${{ inputs.review-compose-file }}
+    steps:
+      - name: Review project name
+        run: |
+          slugify() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-30 | sed -E 's/-+$//'; }
+          if [ "$GITHUB_EVENT_NAME" = delete ]; then
+            [ "$REF_TYPE" = branch ] || { echo "SKIP=1" >> "$GITHUB_ENV"; exit 0; }
+            SLUG=$(slugify "$DELETED_REF")
+          else
+            SLUG="pr-$PR_NUMBER"
+          fi
+          echo "SLUG=$SLUG" >> "$GITHUB_ENV"
+          echo "PROJECT=${{ inputs.image }}-$SLUG" >> "$GITHUB_ENV"
+
+      - name: Setup SSH
+        if: env.SKIP != '1'
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts
+          cat >> ~/.ssh/config <<EOF
+          Host server
+            HostName $SSH_HOST
+            Port $SSH_PORT
+            User $SSH_USER
+            IdentityFile ~/.ssh/id_ed25519
+            ServerAliveInterval 30
+          EOF
+
+      - name: Test SSH connection
+        if: env.SKIP != '1'
+        run: ssh server 'echo "connected as $(whoami) on $(hostname)"'
+
+      - name: Remove review app
+        if: env.SKIP != '1'
+        run: |
+          ssh server "cd $REVIEW_DIR && IMAGE_TAG=none REVIEW_HOST=none SLUG=$SLUG \
+            docker compose -p $PROJECT -f $REVIEW_FILE down -v --remove-orphans" || true
+          ssh server "docker images --format '{{.Repository}}:{{.Tag}}' | grep -E '^${{ inputs.image }}:sha-' | xargs -r docker image rm 2>/dev/null; docker image prune -f" || true
+          echo "### 🧹 Removed review app \`$PROJECT\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────── manual rollback (workflow_dispatch + rollback: true) ─────────────
+  rollback:
+    if: inputs.rollback
+    runs-on: ubuntu-latest
+    environment: ${{ startsWith(github.ref, 'refs/tags/v') && 'production' || (inputs.stage-app-dir != '' && github.ref_name != inputs.deploy-branch) && 'stage' || 'dev' }}
+    concurrency:
+      group: deploy-${{ inputs.image }}-rollback
+      cancel-in-progress: false
+    env:
+      IMAGE: ${{ inputs.image }}
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+    steps:
+      - name: Pick target
+        env:
+          STAGE_RE: ${{ inputs.stage-branches }}
+        run: |
+          T=dev
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then T=production
+          elif [ -n "${{ inputs.stage-app-dir }}" ] && [[ "$GITHUB_REF_NAME" =~ ^($STAGE_RE)$ ]]; then T=stage; fi
+          if [ "$T" = stage ]; then
+            SV="${{ inputs.stage-services }}"; [ -z "$SV" ] && SV="${{ inputs.services }}"
+            HU="${{ inputs.stage-health-url }}"; [ -z "$HU" ] && HU="${{ inputs.health-url }}"
+            { echo "APP_DIR=${{ inputs.stage-app-dir }}"; echo "SERVICES=$SV"; echo "HEALTH_URL=$HU"; echo "CHAN=stage"; echo "PREV=stage-previous"; } >> "$GITHUB_ENV"
+          else
+            { echo "APP_DIR=${{ inputs.app-dir }}"; echo "SERVICES=${{ inputs.services }}"; echo "HEALTH_URL=${{ inputs.health-url }}"; echo "CHAN=latest"; echo "PREV=previous"; } >> "$GITHUB_ENV"
+          fi
+          echo "rolling back $T"
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts
+          cat >> ~/.ssh/config <<EOF
+          Host server
+            HostName $SSH_HOST
+            Port $SSH_PORT
+            User $SSH_USER
+            IdentityFile ~/.ssh/id_ed25519
+            ServerAliveInterval 30
+          EOF
+
+      - name: Test SSH connection
+        run: ssh server 'echo "connected as $(whoami) on $(hostname)"'
+
+      - name: Restore :previous
+        run: |
+          ssh server "docker image inspect $IMAGE:$PREV >/dev/null" || { echo "no $IMAGE:$PREV on the server ❌"; exit 1; }
+          ssh server "docker tag $IMAGE:$CHAN $IMAGE:rolled-back 2>/dev/null; docker tag $IMAGE:$PREV $IMAGE:$CHAN"
+          ssh server "cd $APP_DIR && docker compose up -d --no-build --force-recreate $SERVICES"
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 ${{ inputs.health-retries }}); do
+            CODE=$(ssh server "curl -s -o /dev/null -w '%{http_code}' $HEALTH_URL" || echo 000)
+            if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 500 ]; then
+              echo "healthy ✅ (rollback, HTTP $CODE)"
+              echo "### ↩️ Rolled back \`$IMAGE\` to :$PREV ✅" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "waiting... ($i, HTTP $CODE)"
+            sleep 3
+          done
+          echo "service did not become healthy ❌"
+          ssh server "cd $APP_DIR && docker compose logs --tail 50 $SERVICES"
+          exit 1
 
   # ───────────── release (tags only) ─────────────
   release:
