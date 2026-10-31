@@ -36,7 +36,7 @@
 - [Quick start](#-quick-start)
   - [Go + Docker](#1-go--docker)
   - [Next.js + Docker](#2-nextjs--docker)
-  - [Static site (Next.js export, Vite, …)](#3-static-site)
+  - [Rust + Docker](#3-rust--docker)
   - [Django + Docker](#4-django--docker)
   - [More Docker stacks](#5-more-docker-stacks)
   - [Kubernetes variants](#6-kubernetes-variants)
@@ -269,25 +269,32 @@ jobs:
 > The health check of this template accepts any HTTP code from `200` to `499`, so a page that
 > redirects to `/login` or answers `401` still counts as "up".
 
-### 3. Static site
+### 3. Rust + Docker
+
+Runs `cargo fmt`, `clippy` and `cargo test`, builds the Docker image, deploys it over SSH, and on `v*` tags attaches the release binary to a GitHub Release.
 
 ```yaml
-name: Deploy site
+name: CI/CD
 
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   pipeline:
-    uses: ppeymann/ci-templates/.github/workflows/static-site.yml@v1
+    uses: ppeymann/ci-templates/.github/workflows/rust-docker.yml@v1
     with:
-      remote-dir: ~/my-site/out
-      health-url: http://127.0.0.1:8080
-      build-env: |
-        NEXT_PUBLIC_API_URL=${{ vars.NEXT_PUBLIC_API_URL }}
+      image: my-api
+      app-dir: ~/my-api
+      services: api
+      health-url: http://127.0.0.1:8080/health
+      bin-name: my-api                  # binary attached to releases
     secrets:
       SSH_HOST: ${{ secrets.SSH_HOST }}
       SSH_PORT: ${{ secrets.SSH_PORT }}
@@ -465,39 +472,6 @@ jobs:
       services: api
       health-url: http://127.0.0.1:8080/health
       project: MyApi.sln
-    secrets:
-      SSH_HOST: ${{ secrets.SSH_HOST }}
-      SSH_PORT: ${{ secrets.SSH_PORT }}
-      SSH_USER: ${{ secrets.SSH_USER }}
-      SSH_KEY: ${{ secrets.SSH_KEY }}
-```
-</details>
-
-<details>
-<summary><b>Rust</b>: <code>rust-docker.yml</code></summary>
-
-```yaml
-name: CI/CD
-
-on:
-  push:
-    branches: [main]
-    tags: ["v*"]
-  pull_request:
-  workflow_dispatch:
-
-permissions:
-  contents: write
-
-jobs:
-  pipeline:
-    uses: ppeymann/ci-templates/.github/workflows/rust-docker.yml@v1
-    with:
-      image: my-api
-      app-dir: ~/my-api
-      services: api
-      health-url: http://127.0.0.1:8080/health
-      bin-name: my-api                  # binary attached to releases
     secrets:
       SSH_HOST: ${{ secrets.SSH_HOST }}
       SSH_PORT: ${{ secrets.SSH_PORT }}
