@@ -1,0 +1,323 @@
+name: Node Docker CI/CD
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: "Docker image name, e.g. my-api"
+        type: string
+        required: true
+      app-dir:
+        description: "Project dir on server (has docker-compose.yml), e.g. ~/my-api"
+        type: string
+        required: true
+      services:
+        description: "Compose services to recreate, space separated, e.g. \"api worker\""
+        type: string
+        required: true
+      health-url:
+        description: "Health URL checked from inside the server (200-499 = healthy)"
+        type: string
+        required: true
+      working-directory:
+        description: "Folder of the project inside the repo (has the Dockerfile)"
+        type: string
+        default: "."
+      node-version:
+        type: string
+        default: "22"
+      lint-enabled:
+        type: boolean
+        default: true
+      typecheck-enabled:
+        type: boolean
+        default: true
+      test-env:
+        description: "Extra KEY=VALUE lines for the test job"
+        type: string
+        default: ""
+      platform:
+        type: string
+        default: linux/amd64
+      deploy-branch:
+        type: string
+        default: main
+      trivy-enabled:
+        type: boolean
+        default: true
+      trivy-fail:
+        description: "Fail build on HIGH/CRITICAL vulnerabilities"
+        type: boolean
+        default: false
+      release-enabled:
+        type: boolean
+        default: true
+      health-retries:
+        type: number
+        default: 20
+    secrets:
+      SSH_HOST:
+        required: true
+      SSH_PORT:
+        required: true
+      SSH_USER:
+        required: true
+      SSH_KEY:
+        required: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ───────────── 1. prepare ─────────────
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      deploy: ${{ steps.meta.outputs.deploy }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version and deploy decision
+        id: meta
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_EVENT_NAME" != "pull_request" && "$GITHUB_REF_NAME" == "${{ inputs.deploy-branch }}" ]]; then
+            echo "version=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Detect package manager and install
+        run: |
+          corepack enable || true
+          if [ -f pnpm-lock.yaml ]; then
+            echo "PM=pnpm" >> "$GITHUB_ENV"
+            pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then
+            echo "PM=yarn" >> "$GITHUB_ENV"
+            yarn install --immutable || yarn install --frozen-lockfile
+          else
+            echo "PM=npm" >> "$GITHUB_ENV"
+            npm ci --no-audit --no-fund
+          fi
+
+      - name: Lint
+        if: inputs.lint-enabled
+        run: |
+          has() { node -e "process.exit(require('./package.json').scripts?.['$1'] ? 0 : 1)"; }
+          if has lint; then $PM run lint; else echo "no lint script"; fi
+
+      - name: Typecheck
+        if: inputs.typecheck-enabled
+        run: |
+          has() { node -e "process.exit(require('./package.json').scripts?.['$1'] ? 0 : 1)"; }
+          if has typecheck; then $PM run typecheck; else echo "no typecheck script"; fi
+
+      - name: Build check
+        run: |
+          has() { node -e "process.exit(require('./package.json').scripts?.['$1'] ? 0 : 1)"; }
+          if has build; then $PM run build; fi
+
+  # ───────────── 2. test ─────────────
+  test:
+    needs: prepare
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U test"
+          --health-interval 5s
+          --health-retries 10
+      redis:
+        image: redis:8-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-retries 10
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgres://test:test@localhost:5432/test
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USER: test
+      DB_PASSWORD: test
+      DB_NAME: test
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: test
+      REDIS_URL: redis://localhost:6379/0
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Detect package manager and install
+        run: |
+          corepack enable || true
+          if [ -f pnpm-lock.yaml ]; then
+            echo "PM=pnpm" >> "$GITHUB_ENV"
+            pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then
+            echo "PM=yarn" >> "$GITHUB_ENV"
+            yarn install --immutable || yarn install --frozen-lockfile
+          else
+            echo "PM=npm" >> "$GITHUB_ENV"
+            npm ci --no-audit --no-fund
+          fi
+
+      - name: Extra test env
+        if: inputs.test-env != ''
+        run: |
+          while IFS= read -r line; do
+            [ -n "$line" ] && echo "$line" >> "$GITHUB_ENV"
+          done <<'ENVEOF'
+          ${{ inputs.test-env }}
+          ENVEOF
+
+      - name: Unit tests
+        run: |
+          has() { node -e "process.exit(require('./package.json').scripts?.['$1'] ? 0 : 1)"; }
+          if has test; then $PM test; else echo "no test script"; fi
+
+  # ───────────── 3. build ─────────────
+  build:
+    needs: [prepare, test]
+    if: needs.prepare.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ${{ inputs.image }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        run: |
+          docker buildx build \
+            --platform ${{ inputs.platform }} \
+            -t "$IMAGE:$VERSION" \
+            -t "$IMAGE:latest" \
+            --load ${{ inputs.working-directory }}
+
+      - name: Scan image (trivy)
+        if: inputs.trivy-enabled
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ env.VERSION }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: ${{ inputs.trivy-fail && '1' || '0' }}
+
+      - name: Save image
+        run: docker save "$IMAGE:$VERSION" "$IMAGE:latest" | gzip > image.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: image.tar.gz
+          retention-days: 3
+
+  # ───────────── 4. deploy ─────────────
+  deploy:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    environment: ${{ startsWith(github.ref, 'refs/tags/v') && 'production' || 'dev' }}
+    concurrency:
+      group: deploy-${{ inputs.image }}
+      cancel-in-progress: false
+    env:
+      IMAGE: ${{ inputs.image }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      APP_DIR: ${{ inputs.app-dir }}
+      SERVICES: ${{ inputs.services }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts
+          cat >> ~/.ssh/config <<EOF
+          Host server
+            HostName $SSH_HOST
+            Port $SSH_PORT
+            User $SSH_USER
+            IdentityFile ~/.ssh/id_ed25519
+            ServerAliveInterval 30
+          EOF
+
+      - name: Test SSH connection
+        run: ssh server 'echo "connected as $(whoami) on $(hostname)"'
+
+      - name: Ship image
+        run: gunzip -c image.tar.gz | ssh server 'docker load'
+
+      - name: Restart services
+        run: ssh server "cd $APP_DIR && docker compose up -d --no-build --force-recreate $SERVICES"
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 ${{ inputs.health-retries }}); do
+            CODE=$(ssh server "curl -s -o /dev/null -w '%{http_code}' ${{ inputs.health-url }}" || echo 000)
+            if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 500 ]; then
+              echo "healthy ✅ ($VERSION, HTTP $CODE)"
+              echo "### Deployed \`$IMAGE:$VERSION\` ✅" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "waiting... ($i, HTTP $CODE)"
+            sleep 3
+          done
+          echo "service did not become healthy ❌"
+          ssh server "cd $APP_DIR && docker compose logs --tail 50 $SERVICES"
+          exit 1
+
+      - name: Cleanup old images
+        if: always()
+        run: ssh server 'docker image prune -f' || true
+
+  # ───────────── release (tags only) ─────────────
+  release:
+    needs: [prepare, deploy]
+    if: inputs.release-enabled && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true

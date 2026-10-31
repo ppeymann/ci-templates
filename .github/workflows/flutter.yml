@@ -1,0 +1,205 @@
+name: Flutter CI/CD
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        type: string
+        default: "."
+      flutter-version:
+        description: "Flutter version (empty = latest on channel)"
+        type: string
+        default: ""
+      channel:
+        type: string
+        default: stable
+      java-version:
+        type: string
+        default: "17"
+      build-apk:
+        type: boolean
+        default: true
+      build-aab:
+        type: boolean
+        default: true
+      build-args:
+        description: "Extra flutter build args, e.g. --flavor prod --dart-define=API=https://..."
+        type: string
+        default: ""
+      deploy-branch:
+        type: string
+        default: main
+      release-enabled:
+        type: boolean
+        default: true
+    secrets:
+      ANDROID_KEYSTORE:
+        description: "base64 of upload keystore (.jks); unsigned/debug-signed build if missing"
+        required: false
+      ANDROID_KEYSTORE_PASSWORD:
+        required: false
+      ANDROID_KEY_ALIAS:
+        required: false
+      ANDROID_KEY_PASSWORD:
+        required: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ───────────── 1. prepare ─────────────
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      build: ${{ steps.meta.outputs.build }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version and build decision
+        id: meta
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_EVENT_NAME" != "pull_request" && "$GITHUB_REF_NAME" == "${{ inputs.deploy-branch }}" ]]; then
+            echo "version=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter-version }}
+          channel: ${{ inputs.channel }}
+          cache: true
+
+      - name: Pub get
+        run: flutter pub get
+
+      - name: Format check
+        run: dart format --output=none --set-exit-if-changed .
+
+      - name: Analyze
+        run: flutter analyze
+
+  # ───────────── 2. test ─────────────
+  test:
+    needs: prepare
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter-version }}
+          channel: ${{ inputs.channel }}
+          cache: true
+
+      - name: Tests with coverage
+        run: |
+          flutter pub get
+          if [ -d test ]; then flutter test --coverage; else echo "no test dir"; fi
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          if [ -f coverage/lcov.info ]; then
+            TOTAL=$(awk -F: '/^LF:/ {t+=$2} /^LH:/ {h+=$2} END {if (t>0) printf "%.1f%% lines", 100*h/t}' coverage/lcov.info)
+            echo "$TOTAL"
+            echo "### Coverage: \`$TOTAL\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # ───────────── 3. build ─────────────
+  build:
+    needs: [prepare, test]
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter-version }}
+          channel: ${{ inputs.channel }}
+          cache: true
+
+      - name: Signing (optional)
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KS_B64" ]; then
+            echo "no keystore secret, building with default signing"
+            exit 0
+          fi
+          printf '%s' "$KS_B64" | base64 -d > android/app/upload-keystore.jks
+          {
+            echo "storePassword=$KS_PASS"
+            echo "keyPassword=$KEY_PASS"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "storeFile=upload-keystore.jks"
+          } > android/key.properties
+
+      - name: Build
+        run: |
+          flutter pub get
+          BUILD_NAME="${{ needs.prepare.outputs.version }}"
+          BUILD_NAME="${BUILD_NAME#v}"
+          [[ "$BUILD_NAME" == sha-* ]] && BUILD_NAME="0.0.0"
+          ARGS="--build-name=$BUILD_NAME --build-number=$GITHUB_RUN_NUMBER ${{ inputs.build-args }}"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          if [ "${{ inputs.build-apk }}" = true ]; then
+            # shellcheck disable=SC2086
+            flutter build apk --release $ARGS
+            find build/app/outputs/flutter-apk -name '*-release.apk' -exec cp {} "$GITHUB_WORKSPACE/dist/" \;
+          fi
+          if [ "${{ inputs.build-aab }}" = true ]; then
+            # shellcheck disable=SC2086
+            flutter build appbundle --release $ARGS
+            find build/app/outputs/bundle -name '*.aab' -exec cp {} "$GITHUB_WORKSPACE/dist/" \;
+          fi
+          cd "$GITHUB_WORKSPACE/dist" && sha256sum ./* > checksums.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: dist/*
+          retention-days: 7
+
+  # ───────────── release (tags only) ─────────────
+  release:
+    needs: [prepare, build]
+    if: inputs.release-enabled && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: android
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*

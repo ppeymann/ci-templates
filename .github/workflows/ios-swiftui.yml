@@ -1,0 +1,267 @@
+name: iOS SwiftUI CI/CD
+
+on:
+  workflow_call:
+    inputs:
+      scheme:
+        description: "Xcode scheme to build/test"
+        type: string
+        required: true
+      project:
+        description: "Path to .xcodeproj or .xcworkspace (relative to working-directory)"
+        type: string
+        required: true
+      working-directory:
+        type: string
+        default: "."
+      destination:
+        description: "xcodebuild test destination"
+        type: string
+        default: "platform=iOS Simulator,name=iPhone 16,OS=latest"
+      xcode-version:
+        description: "Xcode to select (empty = runner default), e.g. 16.2"
+        type: string
+        default: ""
+      runs-on:
+        type: string
+        default: macos-latest
+      test-enabled:
+        type: boolean
+        default: true
+      lint-enabled:
+        description: "Run SwiftLint (only if .swiftlint.yml exists)"
+        type: boolean
+        default: true
+      testflight-enabled:
+        description: "On v* tags: archive, export IPA and upload to TestFlight"
+        type: boolean
+        default: false
+      export-method:
+        description: "app-store-connect | release-testing | debugging"
+        type: string
+        default: app-store-connect
+      release-enabled:
+        description: "Create a GitHub release on v* tags (attaches IPA if built)"
+        type: boolean
+        default: true
+    secrets:
+      APP_STORE_CONNECT_KEY_ID:
+        required: false
+      APP_STORE_CONNECT_ISSUER_ID:
+        required: false
+      APP_STORE_CONNECT_KEY_P8:
+        description: "Contents of the AuthKey_XXXX.p8 file"
+        required: false
+      BUILD_CERTIFICATE_P12:
+        description: "base64 of the Apple Distribution .p12"
+        required: false
+      P12_PASSWORD:
+        required: false
+      PROVISIONING_PROFILE:
+        description: "base64 of the .mobileprovision"
+        required: false
+      APPLE_TEAM_ID:
+        required: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ───────────── 1. prepare ─────────────
+  prepare:
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      kind: ${{ steps.meta.outputs.kind }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: meta
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+          case "${{ inputs.project }}" in
+            *.xcworkspace) echo "kind=-workspace" >> "$GITHUB_OUTPUT" ;;
+            *) echo "kind=-project" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: SwiftLint
+        if: inputs.lint-enabled
+        run: |
+          if [ -f .swiftlint.yml ]; then
+            command -v swiftlint >/dev/null || brew install swiftlint
+            swiftlint lint --strict --reporter github-actions-logging
+          else
+            echo "no .swiftlint.yml, skipping"
+          fi
+
+  # ───────────── 2. build + test ─────────────
+  test:
+    needs: prepare
+    runs-on: ${{ inputs.runs-on }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        if: inputs.xcode-version != ''
+        run: sudo xcode-select -s "/Applications/Xcode_${{ inputs.xcode-version }}.app"
+
+      - name: Build
+        run: |
+          xcodebuild ${{ needs.prepare.outputs.kind }} "${{ inputs.project }}" \
+            -scheme "${{ inputs.scheme }}" \
+            -destination "${{ inputs.destination }}" \
+            CODE_SIGNING_ALLOWED=NO build-for-testing -quiet
+
+      - name: Test
+        if: inputs.test-enabled
+        run: |
+          xcodebuild ${{ needs.prepare.outputs.kind }} "${{ inputs.project }}" \
+            -scheme "${{ inputs.scheme }}" \
+            -destination "${{ inputs.destination }}" \
+            -resultBundlePath TestResults.xcresult \
+            -enableCodeCoverage YES \
+            CODE_SIGNING_ALLOWED=NO test-without-building -quiet
+
+      - name: Coverage summary
+        if: always() && inputs.test-enabled
+        run: |
+          if [ -d TestResults.xcresult ]; then
+            TOTAL=$(xcrun xccov view --report TestResults.xcresult | head -2 | tail -1)
+            echo "$TOTAL"
+            echo "### Coverage: \`$TOTAL\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.test-enabled
+        with:
+          name: test-results
+          path: ${{ inputs.working-directory }}/TestResults.xcresult
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ───────────── 3. archive + TestFlight (tags, opt-in) ─────────────
+  testflight:
+    needs: [prepare, test]
+    if: inputs.testflight-enabled && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ inputs.runs-on }}
+    environment: production
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        if: inputs.xcode-version != ''
+        run: sudo xcode-select -s "/Applications/Xcode_${{ inputs.xcode-version }}.app"
+
+      - name: Install certificate and profile
+        env:
+          P12_B64: ${{ secrets.BUILD_CERTIFICATE_P12 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          PROFILE_B64: ${{ secrets.PROVISIONING_PROFILE }}
+        run: |
+          if [ -z "$P12_B64" ] || [ -z "$PROFILE_B64" ]; then
+            echo "::error::BUILD_CERTIFICATE_P12 and PROVISIONING_PROFILE secrets are required for TestFlight"
+            exit 1
+          fi
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KC_PASS=$(uuidgen)
+          printf '%s' "$P12_B64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KC_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KC_PASS" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KC_PASS" "$KEYCHAIN"
+          security list-keychain -d user -s "$KEYCHAIN"
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          printf '%s' "$PROFILE_B64" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/ci.mobileprovision
+
+      - name: App Store Connect API key
+        env:
+          KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          KEY_P8: ${{ secrets.APP_STORE_CONNECT_KEY_P8 }}
+        run: |
+          mkdir -p ~/.appstoreconnect/private_keys
+          printf '%s\n' "$KEY_P8" > ~/.appstoreconnect/private_keys/AuthKey_"$KEY_ID".p8
+
+      - name: Archive
+        run: |
+          xcodebuild ${{ needs.prepare.outputs.kind }} "${{ inputs.project }}" \
+            -scheme "${{ inputs.scheme }}" \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            archive -quiet
+
+      - name: Export IPA
+        env:
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>${{ inputs.export-method }}</string>
+            <key>teamID</key><string>$TEAM_ID</string>
+            <key>signingStyle</key><string>manual</string>
+          </dict></plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$GITHUB_WORKSPACE/dist"
+
+      - name: Upload to TestFlight
+        env:
+          KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          IPA=$(find "$GITHUB_WORKSPACE/dist" -name '*.ipa' | head -1)
+          xcrun altool --upload-app -t ios -f "$IPA" --apiKey "$KEY_ID" --apiIssuer "$ISSUER_ID"
+          echo "### Uploaded \`$VERSION\` to TestFlight 🚀" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipa
+          path: dist/*.ipa
+          retention-days: 7
+
+      - name: Cleanup keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/build.keychain-db" || true
+
+  # ───────────── release (tags only) ─────────────
+  release:
+    needs: [prepare, test, testflight]
+    if: always() && needs.test.result == 'success' && inputs.release-enabled && startsWith(github.ref, 'refs/tags/v') && needs.testflight.result != 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        if: needs.testflight.result == 'success'
+        with:
+          name: ipa
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*.ipa
+          fail_on_unmatched_files: false

@@ -1,0 +1,68 @@
+# Minimal Deployment + Service + Ingress for the *-k8s.yml templates (method: kubectl-set-image).
+# Replace "my-api", the namespace, host and port. CI only swaps the image tag.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-api
+  namespace: my-ns
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels: { app: my-api }
+  strategy:
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  template:
+    metadata:
+      labels: { app: my-api }
+    spec:
+      imagePullSecrets:
+        - name: ghcr          # kubectl create secret docker-registry ghcr --docker-server=ghcr.io ...
+      containers:
+        - name: my-api
+          image: ghcr.io/ppeymann/my-api:latest
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - secretRef: { name: my-api-env }
+          readinessProbe:
+            httpGet: { path: /health, port: 8080 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: 8080 }
+            initialDelaySeconds: 15
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-api
+  namespace: my-ns
+spec:
+  selector: { app: my-api }
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-api
+  namespace: my-ns
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [api.example.com]
+      secretName: my-api-tls
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: my-api, port: { number: 80 } }

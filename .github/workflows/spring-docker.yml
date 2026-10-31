@@ -1,0 +1,390 @@
+name: Spring Boot Docker CI/CD
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: "Docker image name, e.g. my-service"
+        type: string
+        required: true
+      app-dir:
+        description: "Project dir on server (has docker-compose.yml), e.g. ~/my-service"
+        type: string
+        required: true
+      services:
+        description: "Compose services to recreate, space separated, e.g. \"api worker\""
+        type: string
+        required: true
+      health-url:
+        description: "Health URL checked from inside the server (200-499 = healthy)"
+        type: string
+        required: true
+      working-directory:
+        description: "Folder of the project inside the repo (has the Dockerfile)"
+        type: string
+        default: "."
+      java-version:
+        type: string
+        default: "21"
+      build-tool:
+        description: "maven | gradle | auto (detects mvnw/pom.xml or gradlew)"
+        type: string
+        default: auto
+      test-env:
+        description: "Extra KEY=VALUE lines for the test job"
+        type: string
+        default: ""
+      platform:
+        type: string
+        default: linux/amd64
+      deploy-branch:
+        type: string
+        default: main
+      trivy-enabled:
+        type: boolean
+        default: true
+      trivy-fail:
+        description: "Fail build on HIGH/CRITICAL vulnerabilities"
+        type: boolean
+        default: false
+      release-enabled:
+        type: boolean
+        default: true
+      health-retries:
+        type: number
+        default: 20
+    secrets:
+      SSH_HOST:
+        required: true
+      SSH_PORT:
+        required: true
+      SSH_USER:
+        required: true
+      SSH_KEY:
+        required: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ───────────── 1. prepare ─────────────
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      deploy: ${{ steps.meta.outputs.deploy }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version and deploy decision
+        id: meta
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_EVENT_NAME" != "pull_request" && "$GITHUB_REF_NAME" == "${{ inputs.deploy-branch }}" ]]; then
+            echo "version=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Detect build tool
+        id: tool
+        run: |
+          T="${{ inputs.build-tool }}"
+          if [ "$T" = auto ]; then
+            if [ -f mvnw ] || [ -f pom.xml ]; then T=maven; else T=gradle; fi
+          fi
+          if [ "$T" = maven ]; then
+            if [ -f mvnw ]; then chmod +x mvnw; CMD=./mvnw; else CMD=mvn; fi
+          else
+            if [ -f gradlew ]; then chmod +x gradlew; CMD=./gradlew; else CMD=gradle; fi
+          fi
+          echo "tool=$T" >> "$GITHUB_OUTPUT"
+          echo "cmd=$CMD" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: ${{ steps.tool.outputs.tool }}
+          cache-dependency-path: |
+            ${{ inputs.working-directory }}/**/pom.xml
+            ${{ inputs.working-directory }}/**/*.gradle*
+            ${{ inputs.working-directory }}/**/gradle-wrapper.properties
+
+      - name: Compile
+        run: |
+          if [ "${{ steps.tool.outputs.tool }}" = maven ]; then
+            ${{ steps.tool.outputs.cmd }} -B -q -DskipTests compile
+          else
+            ${{ steps.tool.outputs.cmd }} --no-daemon -q compileJava
+          fi
+
+  # ───────────── 2. test ─────────────
+  test:
+    needs: prepare
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U test"
+          --health-interval 5s
+          --health-retries 10
+      redis:
+        image: redis:8-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-retries 10
+    env:
+      SPRING_PROFILES_ACTIVE: test
+      SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/test
+      SPRING_DATASOURCE_USERNAME: test
+      SPRING_DATASOURCE_PASSWORD: test
+      SPRING_DATA_REDIS_HOST: localhost
+      SPRING_DATA_REDIS_PORT: 6379
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect build tool
+        id: tool
+        run: |
+          T="${{ inputs.build-tool }}"
+          if [ "$T" = auto ]; then
+            if [ -f mvnw ] || [ -f pom.xml ]; then T=maven; else T=gradle; fi
+          fi
+          if [ "$T" = maven ]; then
+            if [ -f mvnw ]; then chmod +x mvnw; CMD=./mvnw; else CMD=mvn; fi
+          else
+            if [ -f gradlew ]; then chmod +x gradlew; CMD=./gradlew; else CMD=gradle; fi
+          fi
+          echo "tool=$T" >> "$GITHUB_OUTPUT"
+          echo "cmd=$CMD" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: ${{ steps.tool.outputs.tool }}
+          cache-dependency-path: |
+            ${{ inputs.working-directory }}/**/pom.xml
+            ${{ inputs.working-directory }}/**/*.gradle*
+            ${{ inputs.working-directory }}/**/gradle-wrapper.properties
+
+      - name: Extra test env
+        if: inputs.test-env != ''
+        run: |
+          while IFS= read -r line; do
+            [ -n "$line" ] && echo "$line" >> "$GITHUB_ENV"
+          done <<'ENVEOF'
+          ${{ inputs.test-env }}
+          ENVEOF
+
+      - name: Tests
+        run: |
+          if [ "${{ steps.tool.outputs.tool }}" = maven ]; then
+            ${{ steps.tool.outputs.cmd }} -B verify
+          else
+            ${{ steps.tool.outputs.cmd }} --no-daemon build
+          fi
+
+      - name: JaCoCo summary
+        if: always()
+        run: |
+          CSV=$(find . -name 'jacoco*.csv' -path '*jacoco*' | head -1)
+          if [ -n "$CSV" ]; then
+            TOTAL=$(awk -F, 'NR>1 {m+=$8; c+=$9} END {if (m+c>0) printf "%.1f%% lines", 100*c/(m+c)}' "$CSV")
+            echo "$TOTAL"
+            echo "### Coverage: \`$TOTAL\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "no JaCoCo report found"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-reports
+          path: |
+            ${{ inputs.working-directory }}/target/surefire-reports
+            ${{ inputs.working-directory }}/target/site/jacoco
+            ${{ inputs.working-directory }}/build/reports
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ───────────── 3. build ─────────────
+  build:
+    needs: [prepare, test]
+    if: needs.prepare.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ${{ inputs.image }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        run: |
+          docker buildx build \
+            --platform ${{ inputs.platform }} \
+            -t "$IMAGE:$VERSION" \
+            -t "$IMAGE:latest" \
+            --load ${{ inputs.working-directory }}
+
+      - name: Scan image (trivy)
+        if: inputs.trivy-enabled
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ env.VERSION }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: ${{ inputs.trivy-fail && '1' || '0' }}
+
+      - name: Save image
+        run: docker save "$IMAGE:$VERSION" "$IMAGE:latest" | gzip > image.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: image.tar.gz
+          retention-days: 3
+
+  # ───────────── 4. deploy ─────────────
+  deploy:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    environment: ${{ startsWith(github.ref, 'refs/tags/v') && 'production' || 'dev' }}
+    concurrency:
+      group: deploy-${{ inputs.image }}
+      cancel-in-progress: false
+    env:
+      IMAGE: ${{ inputs.image }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      APP_DIR: ${{ inputs.app-dir }}
+      SERVICES: ${{ inputs.services }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts
+          cat >> ~/.ssh/config <<EOF
+          Host server
+            HostName $SSH_HOST
+            Port $SSH_PORT
+            User $SSH_USER
+            IdentityFile ~/.ssh/id_ed25519
+            ServerAliveInterval 30
+          EOF
+
+      - name: Test SSH connection
+        run: ssh server 'echo "connected as $(whoami) on $(hostname)"'
+
+      - name: Ship image
+        run: gunzip -c image.tar.gz | ssh server 'docker load'
+
+      - name: Restart services
+        run: ssh server "cd $APP_DIR && docker compose up -d --no-build --force-recreate $SERVICES"
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 ${{ inputs.health-retries }}); do
+            CODE=$(ssh server "curl -s -o /dev/null -w '%{http_code}' ${{ inputs.health-url }}" || echo 000)
+            if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 500 ]; then
+              echo "healthy ✅ ($VERSION, HTTP $CODE)"
+              echo "### Deployed \`$IMAGE:$VERSION\` ✅" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "waiting... ($i, HTTP $CODE)"
+            sleep 3
+          done
+          echo "service did not become healthy ❌"
+          ssh server "cd $APP_DIR && docker compose logs --tail 50 $SERVICES"
+          exit 1
+
+      - name: Cleanup old images
+        if: always()
+        run: ssh server 'docker image prune -f' || true
+
+  # ───────────── release (tags only) ─────────────
+  release:
+    needs: [prepare, deploy]
+    if: inputs.release-enabled && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect build tool
+        id: tool
+        run: |
+          T="${{ inputs.build-tool }}"
+          if [ "$T" = auto ]; then
+            if [ -f mvnw ] || [ -f pom.xml ]; then T=maven; else T=gradle; fi
+          fi
+          if [ "$T" = maven ]; then
+            if [ -f mvnw ]; then chmod +x mvnw; CMD=./mvnw; else CMD=mvn; fi
+          else
+            if [ -f gradlew ]; then chmod +x gradlew; CMD=./gradlew; else CMD=gradle; fi
+          fi
+          echo "tool=$T" >> "$GITHUB_OUTPUT"
+          echo "cmd=$CMD" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: ${{ steps.tool.outputs.tool }}
+          cache-dependency-path: |
+            ${{ inputs.working-directory }}/**/pom.xml
+            ${{ inputs.working-directory }}/**/*.gradle*
+            ${{ inputs.working-directory }}/**/gradle-wrapper.properties
+
+      - name: Build jar
+        run: |
+          if [ "${{ steps.tool.outputs.tool }}" = maven ]; then
+            ${{ steps.tool.outputs.cmd }} -B -DskipTests package
+            SRC=target
+          else
+            ${{ steps.tool.outputs.cmd }} --no-daemon -x test bootJar
+            SRC=build/libs
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          find "$SRC" -maxdepth 1 -name '*.jar' ! -name '*-plain.jar' ! -name '*-sources.jar' \
+            -exec cp {} "$GITHUB_WORKSPACE/dist/" \;
+          cd "$GITHUB_WORKSPACE/dist" && sha256sum ./*.jar > checksums.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*

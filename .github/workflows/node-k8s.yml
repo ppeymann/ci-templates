@@ -1,0 +1,700 @@
+name: Node Kubernetes CI/CD
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: "Docker image name, e.g. my-api"
+        type: string
+        required: true
+      working-directory:
+        description: "Folder of the project inside the repo (has the Dockerfile)"
+        type: string
+        default: "."
+      node-version:
+        type: string
+        default: "22"
+      lint-enabled:
+        type: boolean
+        default: true
+      typecheck-enabled:
+        type: boolean
+        default: true
+      test-env:
+        description: "Extra KEY=VALUE lines for the test job"
+        type: string
+        default: ""
+      deploy-branch:
+        type: string
+        default: main
+      trivy-enabled:
+        type: boolean
+        default: true
+      trivy-fail:
+        description: "Fail build on HIGH/CRITICAL vulnerabilities"
+        type: boolean
+        default: false
+      release-enabled:
+        type: boolean
+        default: true
+      registry:
+        description: "Container registry host"
+        type: string
+        default: ghcr.io
+      image-namespace:
+        description: "Registry namespace/org (default: lower-cased repo owner)"
+        type: string
+        default: ""
+      build-platforms:
+        description: "buildx platforms, e.g. linux/amd64,linux/arm64 (QEMU is set up automatically)"
+        type: string
+        default: linux/amd64
+      deployment:
+        description: "App name: Deployment/Service/Ingress (or Helm release) name; review envs use <deployment>-<slug>"
+        type: string
+        required: true
+      prod-k8s-namespace:
+        description: "Namespace for PROD (v* tags)"
+        type: string
+        required: true
+      stage-k8s-namespace:
+        description: "Namespace for STAGE + review envs (empty = prod namespace)"
+        type: string
+        default: ""
+      prod-k8s-context:
+        description: "kube context for PROD (empty = kubeconfig's current context)"
+        type: string
+        default: ""
+      stage-k8s-context:
+        description: "kube context for STAGE/review (empty = current context)"
+        type: string
+        default: ""
+      stage-branches:
+        description: "Regex alternation of branches that deploy to STAGE, e.g. main|develop"
+        type: string
+        default: main
+      review-branches-enabled:
+        description: "Deploy a review env for pushes to other branches"
+        type: boolean
+        default: true
+      review-pr-enabled:
+        description: "Deploy a review env per pull request (same-repo PRs only)"
+        type: boolean
+        default: true
+      prod-domain:
+        description: "Ingress host for PROD, e.g. api.example.com (empty = no Ingress)"
+        type: string
+        default: ""
+      stage-domain:
+        description: "Ingress host for STAGE (empty = stage.<review-domain>)"
+        type: string
+        default: ""
+      review-domain:
+        description: "Wildcard base for review envs: <slug>.<review-domain> (empty = no Ingress)"
+        type: string
+        default: ""
+      ingress-class-name:
+        type: string
+        default: nginx
+      stage-ingress-tls:
+        type: boolean
+        default: true
+      prod-ingress-tls:
+        type: boolean
+        default: true
+      stage-cert-issuer:
+        description: "cert-manager issuer for STAGE/review"
+        type: string
+        default: letsencrypt
+      prod-cert-issuer:
+        description: "cert-manager issuer for PROD"
+        type: string
+        default: letsencrypt
+      cert-issuer-kind:
+        description: "ClusterIssuer | Issuer"
+        type: string
+        default: ClusterIssuer
+      method:
+        description: "builtin (generated Deployment+Service+Ingress) | helm | kustomize | kubectl-set-image"
+        type: string
+        default: builtin
+      container:
+        description: "Container name (default: deployment name / first container)"
+        type: string
+        default: ""
+      container-port:
+        description: "builtin: port the app listens on"
+        type: number
+        default: 8080
+      health-path:
+        description: "builtin: readiness/liveness HTTP path (empty = no probes)"
+        type: string
+        default: ""
+      replicas:
+        description: "builtin: replicas for stage/review"
+        type: number
+        default: 1
+      prod-replicas:
+        description: "builtin: replicas for prod"
+        type: number
+        default: 2
+      env-secret:
+        description: "builtin: k8s Secret loaded with envFrom (optional, e.g. my-api-env)"
+        type: string
+        default: ""
+      image-pull-secret:
+        description: "builtin: imagePullSecret name for a private registry, e.g. ghcr"
+        type: string
+        default: ""
+      manifests:
+        description: "kubectl-set-image: optional file/dir applied first; kustomize: overlay dir; helm: chart path"
+        type: string
+        default: ""
+      helm-values:
+        description: "Helm values file(s), space separated"
+        type: string
+        default: ""
+      helm-extra-args:
+        type: string
+        default: ""
+      migrate-command:
+        description: "If set, runs as a one-off k8s Job with the new image (same env/volumes as the Deployment) before rollout"
+        type: string
+        default: ""
+      rollout-timeout:
+        type: string
+        default: 5m
+    secrets:
+      KUBE_CONFIG_PROD:
+        description: "base64 kubeconfig for PROD"
+        required: true
+      KUBE_CONFIG_STAGE:
+        description: "base64 kubeconfig for STAGE/review (falls back to KUBE_CONFIG_PROD)"
+        required: false
+      REGISTRY_USER:
+        description: "Only for non-GHCR registries"
+        required: false
+      REGISTRY_PASSWORD:
+        description: "Only for non-GHCR registries"
+        required: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ───────────── 1. prepare ─────────────
+  prepare:
+    if: ${{ !(github.event_name == 'delete' || (github.event_name == 'pull_request' && github.event.action == 'closed')) }}
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      deploy: ${{ steps.meta.outputs.deploy }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version and deploy decision
+        id: meta
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_EVENT_NAME" != "pull_request" && "$GITHUB_REF_NAME" == "${{ inputs.deploy-branch }}" ]]; then
+            echo "version=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Detect package manager and install
+        run: |
+          corepack enable || true
+          if [ -f pnpm-lock.yaml ]; then
+            echo "PM=pnpm" >> "$GITHUB_ENV"
+            pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then
+            echo "PM=yarn" >> "$GITHUB_ENV"
+            yarn install --immutable || yarn install --frozen-lockfile
+          else
+            echo "PM=npm" >> "$GITHUB_ENV"
+            npm ci --no-audit --no-fund
+          fi
+
+      - name: Lint
+        if: inputs.lint-enabled
+        run: |
+          has() { node -e "process.exit(require('./package.json').scripts?.['$1'] ? 0 : 1)"; }
+          if has lint; then $PM run lint; else echo "no lint script"; fi
+
+      - name: Typecheck
+        if: inputs.typecheck-enabled
+        run: |
+          has() { node -e "process.exit(require('./package.json').scripts?.['$1'] ? 0 : 1)"; }
+          if has typecheck; then $PM run typecheck; else echo "no typecheck script"; fi
+
+      - name: Build check
+        run: |
+          has() { node -e "process.exit(require('./package.json').scripts?.['$1'] ? 0 : 1)"; }
+          if has build; then $PM run build; fi
+
+  # ───────────── 2. test ─────────────
+  test:
+    needs: prepare
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U test"
+          --health-interval 5s
+          --health-retries 10
+      redis:
+        image: redis:8-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-retries 10
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgres://test:test@localhost:5432/test
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USER: test
+      DB_PASSWORD: test
+      DB_NAME: test
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: test
+      REDIS_URL: redis://localhost:6379/0
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Detect package manager and install
+        run: |
+          corepack enable || true
+          if [ -f pnpm-lock.yaml ]; then
+            echo "PM=pnpm" >> "$GITHUB_ENV"
+            pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then
+            echo "PM=yarn" >> "$GITHUB_ENV"
+            yarn install --immutable || yarn install --frozen-lockfile
+          else
+            echo "PM=npm" >> "$GITHUB_ENV"
+            npm ci --no-audit --no-fund
+          fi
+
+      - name: Extra test env
+        if: inputs.test-env != ''
+        run: |
+          while IFS= read -r line; do
+            [ -n "$line" ] && echo "$line" >> "$GITHUB_ENV"
+          done <<'ENVEOF'
+          ${{ inputs.test-env }}
+          ENVEOF
+
+      - name: Unit tests
+        run: |
+          has() { node -e "process.exit(require('./package.json').scripts?.['$1'] ? 0 : 1)"; }
+          if has test; then $PM test; else echo "no test script"; fi
+
+  # ───────────── target (prod / stage / review) ─────────────
+  target:
+    if: ${{ !(github.event_name == 'delete' || (github.event_name == 'pull_request' && github.event.action == 'closed')) }}
+    runs-on: ubuntu-latest
+    outputs:
+      env: ${{ steps.t.outputs.env }}
+      env-name: ${{ steps.t.outputs.env-name }}
+      version: ${{ steps.t.outputs.version }}
+      release: ${{ steps.t.outputs.release }}
+      namespace: ${{ steps.t.outputs.namespace }}
+      context: ${{ steps.t.outputs.context }}
+      host: ${{ steps.t.outputs.host }}
+      url: ${{ steps.t.outputs.url }}
+      tls: ${{ steps.t.outputs.tls }}
+      issuer: ${{ steps.t.outputs.issuer }}
+      replicas: ${{ steps.t.outputs.replicas }}
+    steps:
+      - name: Pick target
+        id: t
+        env:
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          STAGE_RE: ${{ inputs.stage-branches }}
+          APP: ${{ inputs.deployment }}
+          PROD_NS: ${{ inputs.prod-k8s-namespace }}
+          STAGE_NS: ${{ inputs.stage-k8s-namespace }}
+          REVIEW_DOMAIN: ${{ inputs.review-domain }}
+        run: |
+          slugify() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-30 | sed -E 's/-+$//'; }
+          ENV=none
+          VERSION="sha-${GITHUB_SHA::7}"
+          [ -z "$STAGE_NS" ] && STAGE_NS="$PROD_NS"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            ENV=prod
+            VERSION="$GITHUB_REF_NAME"
+          elif [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            if [ "${{ inputs.review-pr-enabled }}" = true ] && [ "$HEAD_REPO" = "$GITHUB_REPOSITORY" ]; then
+              ENV=review
+              SLUG="pr-$PR_NUMBER"
+            fi
+          elif [[ "$GITHUB_REF" == refs/heads/* ]]; then
+            if [ -n "$STAGE_RE" ] && [[ "$GITHUB_REF_NAME" =~ ^($STAGE_RE)$ ]]; then
+              ENV=stage
+            elif [ "${{ inputs.review-branches-enabled }}" = true ]; then
+              ENV=review
+              SLUG=$(slugify "$GITHUB_REF_NAME")
+            fi
+          fi
+          case "$ENV" in
+            prod)
+              NAME="$APP"; NS="$PROD_NS"; CTX="${{ inputs.prod-k8s-context }}"
+              HOST="${{ inputs.prod-domain }}"; TLS="${{ inputs.prod-ingress-tls }}"
+              ISSUER="${{ inputs.prod-cert-issuer }}"; REPLICAS="${{ inputs.prod-replicas }}"
+              ENV_NAME=production ;;
+            stage)
+              NAME="$APP"; NS="$STAGE_NS"; CTX="${{ inputs.stage-k8s-context }}"
+              HOST="${{ inputs.stage-domain }}"
+              [ -z "$HOST" ] && [ -n "$REVIEW_DOMAIN" ] && HOST="stage.$REVIEW_DOMAIN"
+              TLS="${{ inputs.stage-ingress-tls }}"; ISSUER="${{ inputs.stage-cert-issuer }}"
+              REPLICAS="${{ inputs.replicas }}"; ENV_NAME=stage ;;
+            review)
+              NAME=$(echo "$APP-$SLUG" | cut -c1-53 | sed -E 's/-+$//'); NS="$STAGE_NS"
+              CTX="${{ inputs.stage-k8s-context }}"; HOST=""
+              [ -n "$REVIEW_DOMAIN" ] && HOST="$SLUG.$REVIEW_DOMAIN"
+              TLS="${{ inputs.stage-ingress-tls }}"; ISSUER="${{ inputs.stage-cert-issuer }}"
+              REPLICAS=1; ENV_NAME="review/$SLUG" ;;
+            *)
+              NAME=""; NS=""; CTX=""; HOST=""; TLS=false; ISSUER=""; REPLICAS=0; ENV_NAME="" ;;
+          esac
+          URL=""
+          if [ -n "$HOST" ]; then
+            if [ "$TLS" = true ]; then URL="https://$HOST"; else URL="http://$HOST"; fi
+          fi
+          {
+            echo "env=$ENV"; echo "env-name=$ENV_NAME"; echo "version=$VERSION"
+            echo "release=$NAME"; echo "namespace=$NS"; echo "context=$CTX"
+            echo "host=$HOST"; echo "url=$URL"; echo "tls=$TLS"; echo "issuer=$ISSUER"
+            echo "replicas=$REPLICAS"
+          } >> "$GITHUB_OUTPUT"
+          echo "### Target: \`$ENV\` → \`$NS/$NAME\` ${URL}" >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────── 3. build + push ─────────────
+  build:
+    needs: [prepare, test, target]
+    if: needs.target.outputs.env != 'none'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image-ref: ${{ steps.ref.outputs.ref }}
+    env:
+      VERSION: ${{ needs.target.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+        if: contains(inputs.build-platforms, ',')
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Image name
+        id: ref
+        run: |
+          NS="${{ inputs.image-namespace }}"
+          [ -z "$NS" ] && NS="${GITHUB_REPOSITORY_OWNER,,}"
+          REPO="${{ inputs.registry }}/$NS/${{ inputs.image }}"
+          echo "REPO=$REPO" >> "$GITHUB_ENV"
+          echo "ref=$REPO:$VERSION" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ secrets.REGISTRY_USER || github.actor }}
+          password: ${{ secrets.REGISTRY_PASSWORD || github.token }}
+
+      - name: Build and push
+        run: |
+          TAGS=(-t "$REPO:$VERSION")
+          [ "${{ needs.target.outputs.env }}" != review ] && TAGS+=(-t "$REPO:latest")
+          docker buildx build \
+            --platform "${{ inputs.build-platforms }}" \
+            "${TAGS[@]}" \
+            --push ${{ inputs.working-directory }}
+          echo "### Pushed \`$REPO:$VERSION\` (${{ inputs.build-platforms }}) 📦" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Scan pushed image (trivy)
+        if: inputs.trivy-enabled
+        uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_USERNAME: ${{ secrets.REGISTRY_USER || github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD || github.token }}
+        with:
+          image-ref: ${{ steps.ref.outputs.ref }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: ${{ inputs.trivy-fail && '1' || '0' }}
+
+  # ───────────── 4. deploy (kubernetes) ─────────────
+  deploy:
+    needs: [target, build]
+    if: needs.target.outputs.env != 'none'
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ needs.target.outputs.env-name }}
+      url: ${{ needs.target.outputs.url }}
+    concurrency:
+      group: deploy-k8s-${{ needs.target.outputs.namespace }}-${{ needs.target.outputs.release }}
+      cancel-in-progress: false
+    env:
+      IMAGE_REF: ${{ needs.build.outputs.image-ref }}
+      TARGET: ${{ needs.target.outputs.env }}
+      NS: ${{ needs.target.outputs.namespace }}
+      NAME: ${{ needs.target.outputs.release }}
+      CTX: ${{ needs.target.outputs.context }}
+      HOST: ${{ needs.target.outputs.host }}
+      URL: ${{ needs.target.outputs.url }}
+      TLS: ${{ needs.target.outputs.tls }}
+      ISSUER: ${{ needs.target.outputs.issuer }}
+      REPLICAS: ${{ needs.target.outputs.replicas }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-kubectl@v4
+
+      - name: Kubeconfig (${{ env.TARGET }})
+        env:
+          KC_PROD: ${{ secrets.KUBE_CONFIG_PROD }}
+          KC_STAGE: ${{ secrets.KUBE_CONFIG_STAGE }}
+        run: |
+          KC="$KC_STAGE"
+          [ "$TARGET" = prod ] || [ -z "$KC" ] && KC="$KC_PROD"
+          mkdir -p ~/.kube
+          printf '%s' "$KC" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+          [ -n "$CTX" ] && kubectl config use-context "$CTX"
+          kubectl -n "$NS" get deployments
+
+      - uses: azure/setup-helm@v4
+        if: inputs.method == 'helm'
+
+      - name: Resolve container
+        run: |
+          C="${{ inputs.container }}"
+          if [ -z "$C" ] && [ "${{ inputs.method }}" != builtin ]; then
+            C=$(kubectl -n "$NS" get deployment "$NAME" -o jsonpath='{.spec.template.spec.containers[0].name}' 2>/dev/null || true)
+          fi
+          [ -z "$C" ] && C="${{ inputs.deployment }}"
+          echo "CONTAINER=$C" >> "$GITHUB_ENV"
+          echo "using image $IMAGE_REF (container $C) → $TARGET $NS/$NAME"
+
+      - name: Migrate (one-off Job)
+        if: inputs.migrate-command != ''
+        env:
+          MIGRATE_CMD: ${{ inputs.migrate-command }}
+        run: |
+          if ! kubectl -n "$NS" get deployment "$NAME" >/dev/null 2>&1; then
+            echo "::warning::deployment $NAME not found yet, skipping migration on first install"
+            exit 0
+          fi
+          JOB="$(echo "$NAME" | cut -c1-30)-migrate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          kubectl -n "$NS" get deployment "$NAME" -o json | jq \
+            --arg job "$JOB" --arg c "$CONTAINER" --arg img "$IMAGE_REF" --arg cmd "$MIGRATE_CMD" '
+            .spec.template.spec as $p
+            | {apiVersion: "batch/v1", kind: "Job",
+               metadata: {name: $job, labels: {app: "migrate"}},
+               spec: {backoffLimit: 0, ttlSecondsAfterFinished: 900,
+                 template: {metadata: {labels: {job: $job}},
+                   spec: ($p | .restartPolicy = "Never"
+                     | .containers = [ ($p.containers | map(select(.name == $c)) | .[0])
+                         | .image = $img | .command = ["sh", "-c", $cmd] | del(.args)
+                         | del(.livenessProbe, .readinessProbe, .startupProbe, .ports, .lifecycle) ])}}}' \
+            | kubectl -n "$NS" apply -f -
+          for i in $(seq 1 120); do
+            S=$(kubectl -n "$NS" get job "$JOB" -o jsonpath='{.status.succeeded}')
+            F=$(kubectl -n "$NS" get job "$JOB" -o jsonpath='{.status.failed}')
+            if [ "$S" = "1" ]; then
+              kubectl -n "$NS" logs "job/$JOB" --tail 50 || true
+              echo "migration done ✅"
+              exit 0
+            fi
+            if [ -n "$F" ] && [ "$F" != "0" ]; then
+              break
+            fi
+            sleep 5
+          done
+          echo "migration failed ❌"
+          kubectl -n "$NS" logs "job/$JOB" --tail 100 || true
+          exit 1
+
+      - name: Deploy (${{ inputs.method }})
+        run: |
+          APP="${{ inputs.deployment }}"
+          case "${{ inputs.method }}" in
+            builtin)
+              jq -n                 --arg app "$APP" --arg name "$NAME" --arg img "$IMAGE_REF" --arg c "$CONTAINER"                 --argjson port "${{ inputs.container-port }}" --argjson rep "$REPLICAS"                 --arg hp "${{ inputs.health-path }}" --arg es "${{ inputs.env-secret }}"                 --arg ps "${{ inputs.image-pull-secret }}" --arg host "$HOST" --arg tls "$TLS"                 --arg issuer "$ISSUER" --arg kind "${{ inputs.cert-issuer-kind }}"                 --arg class "${{ inputs.ingress-class-name }}" '
+                {"app.kubernetes.io/name": $app, "app.kubernetes.io/instance": $name} as $l
+                | {"app.kubernetes.io/instance": $name} as $sel
+                | {apiVersion: "apps/v1", kind: "Deployment", metadata: {name: $name, labels: $l},
+                   spec: {replicas: $rep, revisionHistoryLimit: 5, selector: {matchLabels: $sel},
+                     strategy: {rollingUpdate: {maxUnavailable: 0, maxSurge: 1}},
+                     template: {metadata: {labels: $l}, spec: (
+                       {containers: [
+                         ({name: $c, image: $img, ports: [{containerPort: $port}]}
+                          + (if $es != "" then {envFrom: [{secretRef: {name: $es, optional: true}}]} else {} end)
+                          + (if $hp != "" then {
+                               readinessProbe: {httpGet: {path: $hp, port: $port}, periodSeconds: 5},
+                               livenessProbe: {httpGet: {path: $hp, port: $port}, initialDelaySeconds: 20}} else {} end))]}
+                       + (if $ps != "" then {imagePullSecrets: [{name: $ps}]} else {} end))}}} as $dep
+                | {apiVersion: "v1", kind: "Service", metadata: {name: $name, labels: $l},
+                   spec: {selector: $sel, ports: [{port: 80, targetPort: $port}]}} as $svc
+                | {apiVersion: "networking.k8s.io/v1", kind: "Ingress",
+                   metadata: ({name: $name, labels: $l}
+                     + (if $tls == "true" then {annotations: {(if $kind == "Issuer" then "cert-manager.io/issuer" else "cert-manager.io/cluster-issuer" end): $issuer}} else {} end)),
+                   spec: ({ingressClassName: $class,
+                     rules: [{host: $host, http: {paths: [{path: "/", pathType: "Prefix",
+                       backend: {service: {name: $name, port: {number: 80}}}}]}}]}
+                     + (if $tls == "true" then {tls: [{hosts: [$host], secretName: ($name + "-tls")}]} else {} end))} as $ing
+                | {apiVersion: "v1", kind: "List", items: ([$dep, $svc] + (if $host != "" then [$ing] else [] end))}'                 > /tmp/app.json
+              kubectl -n "$NS" apply -f /tmp/app.json
+              ;;
+            kubectl-set-image)
+              if [ "$TARGET" = review ]; then
+                echo "::warning::kubectl-set-image can't create review envs; use builtin or helm"; exit 0
+              fi
+              if [ -n "${{ inputs.manifests }}" ]; then
+                kubectl -n "$NS" apply -f "${{ inputs.manifests }}"
+              fi
+              kubectl -n "$NS" set image "deployment/$NAME" "$CONTAINER=$IMAGE_REF"
+              ;;
+            kustomize)
+              if [ "$TARGET" = review ]; then
+                echo "::warning::kustomize method doesn't create review envs; use builtin or helm"; exit 0
+              fi
+              cd "${{ inputs.manifests }}"
+              kustomize edit set image "${IMAGE_REF%:*}=$IMAGE_REF"
+              kubectl -n "$NS" apply -k .
+              ;;
+            helm)
+              VALUES=""
+              for f in ${{ inputs.helm-values }}; do VALUES="$VALUES -f $f"; done
+              # shellcheck disable=SC2086
+              helm upgrade --install "$NAME" "${{ inputs.manifests }}" -n "$NS" \
+                --set image.repository="${IMAGE_REF%:*}" --set image.tag="${IMAGE_REF##*:}" \
+                --set ingress.host="$HOST" \
+                $VALUES ${{ inputs.helm-extra-args }} \
+                --wait --atomic --timeout "${{ inputs.rollout-timeout }}"
+              ;;
+            *)
+              echo "unknown method ${{ inputs.method }}"; exit 1 ;;
+          esac
+          kubectl -n "$NS" annotate "deployment/$NAME" kubernetes.io/change-cause="$IMAGE_REF" --overwrite || true
+
+      - name: Rollout status
+        run: |
+          kubectl -n "$NS" get "deployment/$NAME" >/dev/null 2>&1 || { echo "no deployment $NAME, nothing to wait for"; exit 0; }
+          if kubectl -n "$NS" rollout status "deployment/$NAME" --timeout "${{ inputs.rollout-timeout }}"; then
+            echo "### Deployed \`$IMAGE_REF\` to $TARGET \`$NS/$NAME\` ✅ ${{ env.URL }}" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "rollout failed ❌"
+          kubectl -n "$NS" describe "deployment/$NAME" | tail -30 || true
+          kubectl -n "$NS" get pods -l "app.kubernetes.io/instance=$NAME" -o wide || true
+          kubectl -n "$NS" logs "deployment/$NAME" --all-containers --tail 50 || true
+          if [ "${{ inputs.method }}" != helm ]; then
+            echo "rolling back ↩️"
+            kubectl -n "$NS" rollout undo "deployment/$NAME" || true
+            kubectl -n "$NS" rollout status "deployment/$NAME" --timeout "${{ inputs.rollout-timeout }}" || true
+          fi
+          exit 1
+
+  # ───────────── cleanup (branch deleted / PR closed) ─────────────
+  cleanup:
+    if: github.event_name == 'delete' || (github.event_name == 'pull_request' && github.event.action == 'closed')
+    runs-on: ubuntu-latest
+    env:
+      TARGET: review
+      CTX: ${{ inputs.stage-k8s-context }}
+      DELETED_REF: ${{ github.event.ref }}
+      REF_TYPE: ${{ github.event.ref_type }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Review release name
+        run: |
+          slugify() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-30 | sed -E 's/-+$//'; }
+          if [ "$GITHUB_EVENT_NAME" = delete ]; then
+            [ "$REF_TYPE" = branch ] || { echo "not a branch, nothing to do"; echo "SKIP=1" >> "$GITHUB_ENV"; exit 0; }
+            SLUG=$(slugify "$DELETED_REF")
+          else
+            SLUG="pr-$PR_NUMBER"
+          fi
+          NAME=$(echo "${{ inputs.deployment }}-$SLUG" | cut -c1-53 | sed -E 's/-+$//')
+          NS="${{ inputs.stage-k8s-namespace }}"
+          [ -z "$NS" ] && NS="${{ inputs.prod-k8s-namespace }}"
+          { echo "NAME=$NAME"; echo "NS=$NS"; } >> "$GITHUB_ENV"
+
+      - uses: azure/setup-kubectl@v4
+        if: env.SKIP != '1'
+
+      - name: Kubeconfig (stage)
+        if: env.SKIP != '1'
+        env:
+          KC_PROD: ${{ secrets.KUBE_CONFIG_PROD }}
+          KC_STAGE: ${{ secrets.KUBE_CONFIG_STAGE }}
+        run: |
+          KC="$KC_STAGE"
+          [ "$TARGET" = prod ] || [ -z "$KC" ] && KC="$KC_PROD"
+          mkdir -p ~/.kube
+          printf '%s' "$KC" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+          [ -n "$CTX" ] && kubectl config use-context "$CTX"
+          kubectl -n "$NS" get deployments
+
+      - uses: azure/setup-helm@v4
+        if: env.SKIP != '1' && inputs.method == 'helm'
+
+      - name: Delete review env
+        if: env.SKIP != '1'
+        run: |
+          if [ "${{ inputs.method }}" = helm ]; then
+            helm uninstall "$NAME" -n "$NS" || true
+          else
+            kubectl -n "$NS" delete deployment,service,ingress -l "app.kubernetes.io/instance=$NAME" --ignore-not-found
+            kubectl -n "$NS" delete secret "$NAME-tls" --ignore-not-found
+          fi
+          echo "### Removed review env \`$NS/$NAME\` 🧹" >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────── release (tags only) ─────────────
+  release:
+    needs: [prepare, deploy]
+    if: inputs.release-enabled && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true

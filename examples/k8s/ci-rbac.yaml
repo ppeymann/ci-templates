@@ -1,0 +1,19 @@
+# Least-privilege ServiceAccount for CI, scoped to one namespace.
+# kubeconfig for it -> base64 -w0 -> secret KUBE_CONFIG_PROD (or KUBE_CONFIG_STAGE); apply once per namespace
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: github-ci, namespace: my-ns }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: github-ci, namespace: my-ns }
+rules:
+  - apiGroups: ["", "apps", "batch", "networking.k8s.io"]
+    resources: ["deployments", "replicasets", "pods", "pods/log", "services", "configmaps", "secrets", "jobs", "ingresses"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: github-ci, namespace: my-ns }
+subjects: [{ kind: ServiceAccount, name: github-ci, namespace: my-ns }]
+roleRef: { kind: Role, name: github-ci, apiGroup: rbac.authorization.k8s.io }
