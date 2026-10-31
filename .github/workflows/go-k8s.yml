@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       image:
-        description: "Docker image name, e.g. referendum"
+        description: "Docker image name, e.g. my-api"
         type: string
         required: true
       go-main:

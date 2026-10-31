@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       image:
-        description: "Docker image name, e.g. referendum-fe"
+        description: "Docker image name, e.g. my-web"
         type: string
         required: true
       node-version:

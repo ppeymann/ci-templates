@@ -4,15 +4,15 @@ on:
   workflow_call:
     inputs:
       image:
-        description: "Docker image name, e.g. referendum-fe"
+        description: "Docker image name, e.g. my-web"
         type: string
         required: true
       app-dir:
-        description: "Project dir on server (has docker-compose.yml), e.g. ~/referendum-fe"
+        description: "Project dir on server (has docker-compose.yml), e.g. ~/my-web"
         type: string
         required: true
       service:
-        description: "Compose service to restart, e.g. referendum-fe"
+        description: "Compose service to restart, e.g. my-web"
         type: string
         required: true
       health-url:

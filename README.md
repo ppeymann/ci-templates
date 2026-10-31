@@ -231,9 +231,9 @@ jobs:
   pipeline:
     uses: ppeymann/ci-templates/.github/workflows/go-docker.yml@v1
     with:
-      image: referendum
-      app-dir: ~/referendum
-      service: referendum-api
+      image: my-api
+      app-dir: ~/my-api
+      service: my-api
       health-url: http://127.0.0.1:8081/health
       go-main: ./cmd/app
     secrets: inherit
@@ -258,9 +258,9 @@ jobs:
   pipeline:
     uses: ppeymann/ci-templates/.github/workflows/nextjs-docker.yml@v1
     with:
-      image: referendum-fe
-      app-dir: ~/referendum-fe
-      service: referendum-fe
+      image: my-web
+      app-dir: ~/my-web
+      service: my-web
       health-url: http://127.0.0.1:3000/login
     secrets: inherit
 ```
@@ -272,7 +272,7 @@ jobs:
 ### 3. Static site
 
 ```yaml
-name: Deploy landing
+name: Deploy site
 
 on:
   push:
@@ -284,10 +284,10 @@ jobs:
   pipeline:
     uses: ppeymann/ci-templates/.github/workflows/static-site.yml@v1
     with:
-      remote-dir: ~/landing/out
-      health-url: http://127.0.0.1:8090
+      remote-dir: ~/my-site/out
+      health-url: http://127.0.0.1:8080
       build-env: |
-        NEXT_PUBLIC_API_BASE_URL=${{ vars.NEXT_PUBLIC_API_BASE_URL }}
+        NEXT_PUBLIC_API_URL=${{ vars.NEXT_PUBLIC_API_URL }}
     secrets:
       SSH_HOST: ${{ secrets.SSH_HOST }}
       SSH_PORT: ${{ secrets.SSH_PORT }}
@@ -297,7 +297,7 @@ jobs:
 
 > [!IMPORTANT]
 > `secrets: inherit` only works when the caller repo and `ci-templates` belong to the **same owner**.
-> For a repo in another account or organization (e.g. `rojavagroup/*`), pass every secret explicitly as above.
+> For a repo in another account or organization, pass every secret explicitly as above.
 
 ### 4. Django + Docker
 
@@ -888,9 +888,9 @@ Turn it off with `pr-coverage-comment: false`. (node, nextjs, rust, laravel and 
 
 | Input | Type | Default | Required | Description |
 |---|---|---|:-:|---|
-| `image` | string | – | ✅ | Docker image name, e.g. referendum |
-| `app-dir` | string | – | ✅ | Project dir on server (has docker-compose.yml), e.g. ~/referendum |
-| `service` | string | – | ✅ | Compose service to restart, e.g. referendum-api |
+| `image` | string | – | ✅ | Docker image name, e.g. my-api |
+| `app-dir` | string | – | ✅ | Project dir on server (has docker-compose.yml), e.g. ~/my-api |
+| `service` | string | – | ✅ | Compose service to restart, e.g. my-api |
 | `health-url` | string | – | ✅ | Health URL checked from inside the server |
 | `go-main` | string | `./cmd/app` |  | Main package for release binaries |
 | `platform` | string | `linux/amd64` |  | Image platform |
@@ -925,9 +925,9 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports
 
 | Input | Type | Default | Required | Description |
 |---|---|---|:-:|---|
-| `image` | string | – | ✅ | Docker image name, e.g. referendum-fe |
-| `app-dir` | string | – | ✅ | Project dir on server (has docker-compose.yml), e.g. ~/referendum-fe |
-| `service` | string | – | ✅ | Compose service to restart, e.g. referendum-fe |
+| `image` | string | – | ✅ | Docker image name, e.g. my-web |
+| `app-dir` | string | – | ✅ | Project dir on server (has docker-compose.yml), e.g. ~/my-web |
+| `service` | string | – | ✅ | Compose service to restart, e.g. my-web |
 | `health-url` | string | – | ✅ | Health URL checked from inside the server |
 | `node-version` | string | `22` |  |  |
 | `platform` | string | `linux/amd64` |  |  |
@@ -1413,12 +1413,12 @@ ssh -F /dev/null -i ~/.ssh/gh_actions -o IdentitiesOnly=yes -o IdentityAgent=non
 | iOS / Flutter | Nothing on a server. iOS runs on `macos-latest`; TestFlight needs an App Store Connect API key + signing assets |
 | Static site | `rsync`, a web server (e.g. `nginx:alpine` container) serving `remote-dir` |
 
-Example static server (port `8090`):
+Example static server (port `8080`):
 
 ```bash
-docker run -d --name landing --restart unless-stopped -p 8090:80 \
-  -v ~/landing/out:/usr/share/nginx/html:ro \
-  -v ~/landing/default.conf:/etc/nginx/conf.d/default.conf:ro \
+docker run -d --name my-site --restart unless-stopped -p 8080:80 \
+  -v ~/my-site/out:/usr/share/nginx/html:ro \
+  -v ~/my-site/default.conf:/etc/nginx/conf.d/default.conf:ro \
   nginx:alpine
 ```
 
