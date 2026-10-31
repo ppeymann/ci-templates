@@ -27,6 +27,7 @@
   - [Go + Docker](#1-go--docker)
   - [Next.js + Docker](#2-nextjs--docker)
   - [Static site (Next.js export, Vite, …)](#3-static-site)
+  - [Django + Docker](#4-django--docker)
 - [Inputs reference](#-inputs-reference)
 - [Secrets & variables](#-secrets--variables)
 - [Server prerequisites](#-server-prerequisites)
@@ -49,6 +50,7 @@ ci-templates/
     └── workflows/
         ├── go-docker.yml       # Go API  → Docker image → server (docker compose)
         ├── nextjs-docker.yml   # Next.js → Docker image → server (docker compose)
+        ├── django-docker.yml   # Django  → Docker image → migrate → server (docker compose)
         └── static-site.yml     # Static build (out/) → rsync → server (nginx)
 ```
 
@@ -58,24 +60,25 @@ ci-templates/
 |---|---|---|---|---|---|---|
 | [`go-docker.yml`](.github/workflows/go-docker.yml) | Go services | Docker image | `docker load` + `docker compose up` | `go test` with Postgres 17 + Redis 8 services, coverage | Trivy | ✅ binaries for linux/amd64, linux/arm64, darwin/arm64 + checksums |
 | [`nextjs-docker.yml`](.github/workflows/nextjs-docker.yml) | Next.js apps (`output: "standalone"`) | Docker image | `docker load` + `docker compose up` | `npm test --if-present` | Trivy | ✅ release notes |
+| [`django-docker.yml`](.github/workflows/django-docker.yml) | Django apps (+ Celery) | Docker image | `docker load` + `migrate` + `collectstatic` + `docker compose up` | `manage.py check`, missing-migrations check, tests with Postgres 17 + Redis 8, coverage | Trivy | ✅ release notes |
 | [`static-site.yml`](.github/workflows/static-site.yml) | Static sites (`output: "export"`, Vite, …) | `out/` folder | `rsync --delete` | lint | – | – |
 
 ## 🔄 How a pipeline flows
 
-### Docker templates (Go / Next.js)
+### Docker templates (Go / Next.js / Django)
 
 ```mermaid
 flowchart LR
     A([push / PR / tag]) --> P
 
     subgraph CI [" CI (every run) "]
-      P["🧹 prepare<br/>version + deploy decision<br/>lint · typecheck · vet · fmt"] --> T["🧪 test<br/>unit tests · coverage"]
+      P["🧹 prepare<br/>version + deploy decision<br/>lint · typecheck · vet · fmt · ruff"] --> T["🧪 test<br/>unit tests · coverage"]
     end
 
     T -->|deploy = true| B
 
     subgraph CD [" CD (main + v* tags) "]
-      B["🐳 build<br/>docker buildx · trivy scan<br/>save image artifact"] --> D["🚀 deploy<br/>ssh · docker load<br/>compose up · health check"]
+      B["🐳 build<br/>docker buildx · trivy scan<br/>save image artifact"] --> D["🚀 deploy<br/>ssh · docker load<br/>(Django: migrate · collectstatic)<br/>compose up · health check"]
     end
 
     D -->|tag v*| R["🏷️ release<br/>GitHub Release"]
@@ -199,6 +202,43 @@ jobs:
 > `secrets: inherit` only works when the caller repo and `ci-templates` belong to the **same owner**.
 > For a repo in another account or organization (e.g. `rojavagroup/*`), pass every secret explicitly as above.
 
+### 4. Django + Docker
+
+```yaml
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  pipeline:
+    uses: ppeymann/ci-templates/.github/workflows/django-docker.yml@v1
+    with:
+      image: my-backend
+      app-dir: ~/backend
+      services: web celery
+      health-url: http://127.0.0.1:8000/admin/login/
+      test-env: |
+        DJANGO_SETTINGS_MODULE=config.settings
+    secrets:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_KEY: ${{ secrets.SSH_KEY }}
+```
+
+> [!NOTE]
+> On deploy, `migrate` and `collectstatic` run in a one-off container of the **new** image
+> (`docker compose run --rm --no-deps <migrate-service>`) **before** the services are recreated,
+> so a failing migration stops the deploy and the old version keeps running.
+
 ## 📖 Inputs reference
 
 <details open>
@@ -240,6 +280,36 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports
 | `trivy-fail` | boolean | `false` | | Fail on HIGH/CRITICAL vulnerabilities |
 | `release-enabled` | boolean | `true` | | GitHub Release on `v*` tags |
 | `health-retries` | number | `20` | | Health check attempts (3 s apart) |
+</details>
+
+<details>
+<summary><b>django-docker.yml</b></summary>
+
+| Input | Type | Default | Required | Description |
+|---|---|---|:-:|---|
+| `image` | string | – | ✅ | Docker image name |
+| `app-dir` | string | – | ✅ | Project dir on the server (holds `docker-compose.yml`) |
+| `services` | string | – | ✅ | Compose services to recreate, space separated (`web celery celery-beat`) |
+| `health-url` | string | – | ✅ | URL checked from inside the server (200–499 = healthy) |
+| `migrate-service` | string | first of `services` | | Service used for `migrate` / `collectstatic` |
+| `working-directory` | string | `.` | | Folder with `manage.py` and `Dockerfile` |
+| `python-version` | string | `3.12` | | Python version in CI |
+| `install-command` | string | `pip install -r requirements.txt` | | Dependency install in CI |
+| `test-command` | string | `coverage run manage.py test` | | Test command (e.g. `coverage run -m pytest`) |
+| `test-env` | string | `""` | | Extra `KEY=VALUE` lines for the test job |
+| `manage-cmd` | string | `python manage.py` | | How `manage.py` is called inside the container |
+| `lint-enabled` | boolean | `true` | | `ruff check` + `ruff format --check`, only if a ruff config exists |
+| `migrate-enabled` | boolean | `true` | | Run `migrate --noinput` on deploy |
+| `collectstatic-enabled` | boolean | `true` | | Run `collectstatic --noinput` on deploy |
+| `platform` | string | `linux/amd64` | | Image platform |
+| `deploy-branch` | string | `main` | | Branch that auto-deploys |
+| `trivy-enabled` | boolean | `true` | | Scan the image with Trivy |
+| `trivy-fail` | boolean | `false` | | Fail on HIGH/CRITICAL vulnerabilities |
+| `release-enabled` | boolean | `true` | | GitHub Release on `v*` tags |
+| `health-retries` | number | `20` | | Health check attempts (3 s apart) |
+
+The `test` job starts **Postgres 17** and **Redis 8** and exports common names so most settings files work as-is:
+`DATABASE_URL`, `DB_*`, `POSTGRES_*`, `REDIS_URL`, `CELERY_BROKER_URL`, `SECRET_KEY`, `DJANGO_SECRET_KEY` (dummy value), `DEBUG=False`.
 </details>
 
 <details>
@@ -352,6 +422,8 @@ git tag -f v1 && git push origin v1 --force
 | `Permission denied (publickey)` | Deploy public key not on the server | `ssh-copy-id -f -i ~/.ssh/gh_actions.pub user@server` |
 | Push does not start the workflow | Branch is `master` but trigger is `main`, or no new commit | `git branch -m master main`, or `git commit --allow-empty -m "ci: retrigger"` |
 | Health check fails | App can't reach DB/config, wrong port or path | Read the 50 log lines printed by the job; check `.env` and `health-url` |
+| Django `check` / tests fail with `ImproperlyConfigured` | Settings need an env var CI doesn't set | Add it with `test-env` (e.g. `DJANGO_SETTINGS_MODULE=...`) |
+| Deploy stops at **Migrate** | Migration error, or service not using `image: <image>:latest` | Read the job log; fix the migration; check `docker-compose.yml` |
 | Static build has no API data | Backend unreachable at build time | Make sure the `NEXT_PUBLIC_*` URL answers from GitHub runners |
 
 ## 🗺 Roadmap
