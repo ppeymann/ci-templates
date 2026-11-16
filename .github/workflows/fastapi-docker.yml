@@ -16,7 +16,7 @@ on:
         type: string
         required: true
       health-url:
-        description: "Health URL checked from inside the server (200-499 = healthy)"
+        description: "Health URL checked from inside the server (accepted statuses: health-status-codes, default 2xx)"
         type: string
         required: true
       working-directory:
@@ -133,19 +133,41 @@ on:
         description: "Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only"
         type: boolean
         default: true
+      health-status-codes:
+        description: "Comma-separated HTTP statuses that count as healthy. Tokens: 2xx, 200, 200-399. Default is 2xx only. Set 200-499 to keep the previous behavior."
+        type: string
+        default: "2xx"
+      ssh-host-fingerprint:
+        description: "Trusted SSH host-key fingerprint(s), SHA256:… from ssh-keygen -lf. Comma-separated. Alternative to the SSH_KNOWN_HOSTS secret."
+        type: string
+        default: ""
+      allow-insecure-ssh:
+        description: "INSECURE opt-out. Trust the ssh-keyscan key without comparing it to a trusted fingerprint. Off by default."
+        type: boolean
+        default: false
     secrets:
       SSH_HOST:
-        required: true
+        description: "Server hostname or IP. Required only when a deploy job runs."
+        required: false
       SSH_PORT:
-        required: true
+        description: "SSH port. Required only when a deploy job runs."
+        required: false
       SSH_USER:
-        required: true
+        description: "SSH user. Required only when a deploy job runs."
+        required: false
       SSH_KEY:
-        required: true
+        description: "Private deploy key. Required only when a deploy job runs."
+        required: false
+      SSH_KNOWN_HOSTS:
+        description: "Trusted server public keys (known_hosts lines or a public key) or SHA256 fingerprints. Required for deploy unless ssh-host-fingerprint is set or allow-insecure-ssh is true."
+        required: false
 
 defaults:
   run:
     shell: bash
+
+permissions:
+  contents: read
 
 jobs:
   # ───────────── 1. prepare ─────────────
@@ -161,7 +183,7 @@ jobs:
       run:
         working-directory: ${{ inputs.working-directory }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Version and deploy decision
         id: meta
@@ -199,7 +221,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "### Target: \`$TARGET\` ($VERSION)" >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         if: inputs.lint-enabled
         with:
           python-version: ${{ inputs.python-version }}
@@ -220,6 +242,9 @@ jobs:
     needs: prepare
     if: inputs.test-enabled
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     services:
       postgres:
         image: postgres:17-alpine
@@ -258,9 +283,9 @@ jobs:
       run:
         working-directory: ${{ inputs.working-directory }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: ${{ inputs.python-version }}
           cache: pip
@@ -294,7 +319,7 @@ jobs:
             echo "COVERAGE_TOTAL=$TOTAL" >> "$GITHUB_ENV"
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: inputs.coverage-enabled && (always())
         with:
           name: coverage
@@ -305,7 +330,7 @@ jobs:
       - name: Coverage comment on PR
         if: inputs.coverage-enabled && (always() && inputs.pr-coverage-comment && github.event_name == 'pull_request' && env.COVERAGE_TOTAL != '' && github.event.pull_request.head.repo.full_name == github.repository)
         continue-on-error: true
-        uses: marocchino/sticky-pull-request-comment@v2
+        uses: marocchino/sticky-pull-request-comment@773744901bac0e8cbb5a0dc842800d45e9b2b405 # v2.9.4
         with:
           header: coverage-${{ github.workflow }}
           message: |
@@ -322,9 +347,9 @@ jobs:
       IMAGE: ${{ inputs.image }}
       VERSION: ${{ needs.prepare.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Build image
         run: |
@@ -335,7 +360,7 @@ jobs:
 
       - name: Scan image (trivy)
         if: inputs.trivy-enabled
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ env.IMAGE }}:${{ env.VERSION }}
           severity: CRITICAL,HIGH
@@ -345,7 +370,7 @@ jobs:
       - name: Save image
         run: docker save "$IMAGE:$VERSION" | gzip > image.tar.gz
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: image
           path: image.tar.gz
@@ -372,24 +397,126 @@ jobs:
       CHAN: ${{ needs.prepare.outputs.target == 'stage' && 'stage' || 'latest' }}
       PREV: ${{ needs.prepare.outputs.target == 'stage' && 'stage-previous' || 'previous' }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: image
 
       - name: Setup SSH
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          SSH_HOST_FINGERPRINT: ${{ inputs.ssh-host-fingerprint }}
+          ALLOW_INSECURE_SSH: ${{ inputs.allow-insecure-ssh }}
         run: |
+          set -euo pipefail
+
+          missing=()
+          [ -z "${SSH_HOST:-}" ] && missing+=(SSH_HOST)
+          [ -z "${SSH_PORT:-}" ] && missing+=(SSH_PORT)
+          [ -z "${SSH_USER:-}" ] && missing+=(SSH_USER)
+          [ -z "${SSH_KEY:-}" ] && missing+=(SSH_KEY)
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Deploy is enabled but these secrets are empty: ${missing[*]}. Pass SSH_HOST, SSH_PORT, SSH_USER and SSH_KEY, or set deploy-enabled: false for CI only."
+            exit 1
+          fi
+
+          umask 077
           mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts
-          cat >> ~/.ssh/config <<EOF
+
+          scan=$(mktemp)
+          scan_err=$(mktemp)
+          if ! ssh-keyscan -p "$SSH_PORT" -T 10 "$SSH_HOST" >"$scan" 2>"$scan_err"; then
+            echo "::error::ssh-keyscan failed for ${SSH_HOST}:${SSH_PORT}"
+            cat "$scan_err"
+            exit 1
+          fi
+          grep -vE '^[[:space:]]*(#|$)' "$scan" >"${scan}.clean" || true
+          mv "${scan}.clean" "$scan"
+          if [ ! -s "$scan" ]; then
+            echo "::error::ssh-keyscan returned no host keys for ${SSH_HOST}:${SSH_PORT}"
+            cat "$scan_err"
+            exit 1
+          fi
+
+          if [ "${ALLOW_INSECURE_SSH:-false}" = "true" ]; then
+            echo "::warning::allow-insecure-ssh is true: SSH host key verification is disabled. The key returned by ssh-keyscan is trusted as-is. Do not use this against a host you cannot already trust."
+            cat "$scan" > ~/.ssh/known_hosts
+          else
+            material=$(mktemp)
+            printf '%s\n' "${SSH_HOST_FINGERPRINT:-}" >"$material"
+            printf '%s\n' "${SSH_KNOWN_HOSTS:-}" >>"$material"
+            if [ -n "${SSH_KNOWN_HOSTS:-}" ]; then
+              kh=$(mktemp)
+              printf '%s\n' "$SSH_KNOWN_HOSTS" >"$kh"
+              if ssh-keygen -lf "$kh" -E sha256 >"${kh}.fp" 2>/dev/null; then
+                cat "${kh}.fp" >>"$material"
+              else
+                while IFS= read -r line || [ -n "$line" ]; do
+                  case "$line" in
+                    ''|\#*) continue ;;
+                  esac
+                  fp=$(printf '%s\n' "$line" | ssh-keygen -lf - -E sha256 2>/dev/null | awk '{print $2}' || true)
+                  if [ -n "$fp" ]; then
+                    printf '%s\n' "$fp" >>"$material"
+                  fi
+                done <"$kh"
+              fi
+            fi
+            trusted=$(mktemp)
+            sed -E 's/[Ss][Hh][Aa]256:/SHA256:/g' "$material" \
+              | grep -oE 'SHA256:[A-Za-z0-9+/]+={0,2}' \
+              | sort -u >"$trusted" || true
+            if [ ! -s "$trusted" ]; then
+              echo "::error::Refusing to deploy: no trusted SSH host key for ${SSH_HOST}:${SSH_PORT}. Set secret SSH_KNOWN_HOSTS (known_hosts lines or a public key) or input ssh-host-fingerprint (SHA256 fingerprint from ssh-keygen -lf). Verify that value out of band before saving it. To skip this check, set allow-insecure-ssh: true (insecure; off by default)."
+              exit 1
+            fi
+            : > ~/.ssh/known_hosts
+            matched=0
+            ignored=0
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              fp=$(printf '%s\n' "$line" | ssh-keygen -lf - -E sha256 2>/dev/null | awk '{print $2}' || true)
+              if [ -n "$fp" ] && grep -qxF "$fp" "$trusted"; then
+                printf '%s\n' "$line" >> ~/.ssh/known_hosts
+                echo "SSH host key accepted: $fp"
+                matched=$((matched + 1))
+              else
+                ignored=$((ignored + 1))
+              fi
+            done <"$scan"
+            if [ "$ignored" -gt 0 ]; then
+              echo "Ignored ${ignored} scanned host key(s) that were not in the trusted set."
+            fi
+            if [ "$matched" -eq 0 ]; then
+              echo "::error::SSH host key verification failed for ${SSH_HOST}:${SSH_PORT}. No scanned key matches the trusted fingerprint(s)."
+              echo "Scanned:"
+              ssh-keygen -lf "$scan" -E sha256 || true
+              echo "Trusted:"
+              cat "$trusted"
+              exit 1
+            fi
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+          cat > ~/.ssh/config <<EOF
           Host server
             HostName $SSH_HOST
             Port $SSH_PORT
             User $SSH_USER
             IdentityFile ~/.ssh/id_ed25519
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            GlobalKnownHostsFile /dev/null
+            UpdateHostKeys no
             ServerAliveInterval 30
           EOF
+          chmod 600 ~/.ssh/config
 
       - name: Test SSH connection
         run: ssh server 'echo "connected as $(whoami) on $(hostname)"'
@@ -418,10 +545,84 @@ jobs:
         run: ssh server "cd $APP_DIR && docker compose up -d --no-build --force-recreate $SERVICES"
 
       - name: Health check
+        env:
+          HEALTH_STATUS_CODES: ${{ inputs.health-status-codes }}
         run: |
+          read_health_spec() {
+            if [ -z "${HEALTH_STATUS_CODES+x}" ]; then
+              printf '%s' "2xx"
+            elif [ -z "$HEALTH_STATUS_CODES" ]; then
+              echo "::error::health-status-codes is empty" >&2
+              exit 1
+            else
+              printf '%s' "$HEALTH_STATUS_CODES"
+            fi
+          }
+
+          validate_health_spec() {
+            local raw spec tok lo hi count
+            raw=$(read_health_spec) || exit $?
+            spec=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr ',;' '\n' | tr -s '[:space:]' '\n')
+            count=0
+            while IFS= read -r tok; do
+              [ -z "$tok" ] && continue
+              if [[ "$tok" =~ ^([1-5])xx$ ]]; then
+                count=$((count + 1))
+                continue
+              elif [[ "$tok" =~ ^([0-9]{3})-([0-9]{3})$ ]]; then
+                lo=${BASH_REMATCH[1]}
+                hi=${BASH_REMATCH[2]}
+                if (( 10#$lo > 10#$hi )); then
+                  echo "::error::Invalid health-status-codes range '${tok}'."
+                  exit 1
+                fi
+                count=$((count + 1))
+              elif [[ "$tok" =~ ^[0-9]{3}$ ]]; then
+                count=$((count + 1))
+              else
+                echo "::error::Invalid health-status-codes token '${tok}'. Use 2xx, 200, or 200-399, comma-separated."
+                exit 1
+              fi
+            done <<< "$spec"
+            if [ "$count" -eq 0 ]; then
+              echo "::error::health-status-codes has no status tokens. Use 2xx, 200, or 200-399, comma-separated."
+              exit 1
+            fi
+          }
+
+          health_code_ok() {
+            local code raw spec tok lo hi
+            code=$(printf '%s' "$1" | tr -d '[:space:]')
+            [[ "$code" =~ ^[0-9]{3}$ ]] || return 1
+            raw=$(read_health_spec) || exit $?
+            spec=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr ',;' '\n' | tr -s '[:space:]' '\n')
+            while IFS= read -r tok; do
+              [ -z "$tok" ] && continue
+              if [[ "$tok" =~ ^([1-5])xx$ ]]; then
+                if [[ "${code:0:1}" == "${BASH_REMATCH[1]}" ]]; then
+                  return 0
+                fi
+              elif [[ "$tok" =~ ^([0-9]{3})-([0-9]{3})$ ]]; then
+                lo=${BASH_REMATCH[1]}
+                hi=${BASH_REMATCH[2]}
+                if (( 10#$code >= 10#$lo && 10#$code <= 10#$hi )); then
+                  return 0
+                fi
+              elif [[ "$tok" =~ ^[0-9]{3}$ ]]; then
+                if [[ "$code" == "$tok" ]]; then
+                  return 0
+                fi
+              else
+                echo "::error::Invalid health-status-codes token '${tok}'. Use 2xx, 200, or 200-399, comma-separated."
+                exit 1
+              fi
+            done <<< "$spec"
+            return 1
+          }
+          validate_health_spec
           for i in $(seq 1 ${{ inputs.health-retries }}); do
             CODE=$(ssh server "curl -s -o /dev/null -w '%{http_code}' $HEALTH_URL" || echo 000)
-            if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 500 ]; then
+            if health_code_ok "$CODE"; then
               echo "healthy ✅ ($VERSION, HTTP $CODE)"
               echo "### Deployed \`$IMAGE:$VERSION\` to ${{ needs.prepare.outputs.target }} ✅" >> "$GITHUB_STEP_SUMMARY"
               exit 0
@@ -470,24 +671,126 @@ jobs:
       REVIEW_DIR: ${{ inputs.review-app-dir != '' && inputs.review-app-dir || inputs.app-dir }}
       REVIEW_FILE: ${{ inputs.review-compose-file }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: image
 
       - name: Setup SSH
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          SSH_HOST_FINGERPRINT: ${{ inputs.ssh-host-fingerprint }}
+          ALLOW_INSECURE_SSH: ${{ inputs.allow-insecure-ssh }}
         run: |
+          set -euo pipefail
+
+          missing=()
+          [ -z "${SSH_HOST:-}" ] && missing+=(SSH_HOST)
+          [ -z "${SSH_PORT:-}" ] && missing+=(SSH_PORT)
+          [ -z "${SSH_USER:-}" ] && missing+=(SSH_USER)
+          [ -z "${SSH_KEY:-}" ] && missing+=(SSH_KEY)
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Deploy is enabled but these secrets are empty: ${missing[*]}. Pass SSH_HOST, SSH_PORT, SSH_USER and SSH_KEY, or set deploy-enabled: false for CI only."
+            exit 1
+          fi
+
+          umask 077
           mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts
-          cat >> ~/.ssh/config <<EOF
+
+          scan=$(mktemp)
+          scan_err=$(mktemp)
+          if ! ssh-keyscan -p "$SSH_PORT" -T 10 "$SSH_HOST" >"$scan" 2>"$scan_err"; then
+            echo "::error::ssh-keyscan failed for ${SSH_HOST}:${SSH_PORT}"
+            cat "$scan_err"
+            exit 1
+          fi
+          grep -vE '^[[:space:]]*(#|$)' "$scan" >"${scan}.clean" || true
+          mv "${scan}.clean" "$scan"
+          if [ ! -s "$scan" ]; then
+            echo "::error::ssh-keyscan returned no host keys for ${SSH_HOST}:${SSH_PORT}"
+            cat "$scan_err"
+            exit 1
+          fi
+
+          if [ "${ALLOW_INSECURE_SSH:-false}" = "true" ]; then
+            echo "::warning::allow-insecure-ssh is true: SSH host key verification is disabled. The key returned by ssh-keyscan is trusted as-is. Do not use this against a host you cannot already trust."
+            cat "$scan" > ~/.ssh/known_hosts
+          else
+            material=$(mktemp)
+            printf '%s\n' "${SSH_HOST_FINGERPRINT:-}" >"$material"
+            printf '%s\n' "${SSH_KNOWN_HOSTS:-}" >>"$material"
+            if [ -n "${SSH_KNOWN_HOSTS:-}" ]; then
+              kh=$(mktemp)
+              printf '%s\n' "$SSH_KNOWN_HOSTS" >"$kh"
+              if ssh-keygen -lf "$kh" -E sha256 >"${kh}.fp" 2>/dev/null; then
+                cat "${kh}.fp" >>"$material"
+              else
+                while IFS= read -r line || [ -n "$line" ]; do
+                  case "$line" in
+                    ''|\#*) continue ;;
+                  esac
+                  fp=$(printf '%s\n' "$line" | ssh-keygen -lf - -E sha256 2>/dev/null | awk '{print $2}' || true)
+                  if [ -n "$fp" ]; then
+                    printf '%s\n' "$fp" >>"$material"
+                  fi
+                done <"$kh"
+              fi
+            fi
+            trusted=$(mktemp)
+            sed -E 's/[Ss][Hh][Aa]256:/SHA256:/g' "$material" \
+              | grep -oE 'SHA256:[A-Za-z0-9+/]+={0,2}' \
+              | sort -u >"$trusted" || true
+            if [ ! -s "$trusted" ]; then
+              echo "::error::Refusing to deploy: no trusted SSH host key for ${SSH_HOST}:${SSH_PORT}. Set secret SSH_KNOWN_HOSTS (known_hosts lines or a public key) or input ssh-host-fingerprint (SHA256 fingerprint from ssh-keygen -lf). Verify that value out of band before saving it. To skip this check, set allow-insecure-ssh: true (insecure; off by default)."
+              exit 1
+            fi
+            : > ~/.ssh/known_hosts
+            matched=0
+            ignored=0
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              fp=$(printf '%s\n' "$line" | ssh-keygen -lf - -E sha256 2>/dev/null | awk '{print $2}' || true)
+              if [ -n "$fp" ] && grep -qxF "$fp" "$trusted"; then
+                printf '%s\n' "$line" >> ~/.ssh/known_hosts
+                echo "SSH host key accepted: $fp"
+                matched=$((matched + 1))
+              else
+                ignored=$((ignored + 1))
+              fi
+            done <"$scan"
+            if [ "$ignored" -gt 0 ]; then
+              echo "Ignored ${ignored} scanned host key(s) that were not in the trusted set."
+            fi
+            if [ "$matched" -eq 0 ]; then
+              echo "::error::SSH host key verification failed for ${SSH_HOST}:${SSH_PORT}. No scanned key matches the trusted fingerprint(s)."
+              echo "Scanned:"
+              ssh-keygen -lf "$scan" -E sha256 || true
+              echo "Trusted:"
+              cat "$trusted"
+              exit 1
+            fi
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+          cat > ~/.ssh/config <<EOF
           Host server
             HostName $SSH_HOST
             Port $SSH_PORT
             User $SSH_USER
             IdentityFile ~/.ssh/id_ed25519
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            GlobalKnownHostsFile /dev/null
+            UpdateHostKeys no
             ServerAliveInterval 30
           EOF
+          chmod 600 ~/.ssh/config
 
       - name: Test SSH connection
         run: ssh server 'echo "connected as $(whoami) on $(hostname)"'
@@ -501,10 +804,84 @@ jobs:
             docker compose -p $PROJECT -f $REVIEW_FILE up -d --no-build --force-recreate --remove-orphans"
 
       - name: Health check (via Traefik)
+        env:
+          HEALTH_STATUS_CODES: ${{ inputs.health-status-codes }}
         run: |
+          read_health_spec() {
+            if [ -z "${HEALTH_STATUS_CODES+x}" ]; then
+              printf '%s' "2xx"
+            elif [ -z "$HEALTH_STATUS_CODES" ]; then
+              echo "::error::health-status-codes is empty" >&2
+              exit 1
+            else
+              printf '%s' "$HEALTH_STATUS_CODES"
+            fi
+          }
+
+          validate_health_spec() {
+            local raw spec tok lo hi count
+            raw=$(read_health_spec) || exit $?
+            spec=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr ',;' '\n' | tr -s '[:space:]' '\n')
+            count=0
+            while IFS= read -r tok; do
+              [ -z "$tok" ] && continue
+              if [[ "$tok" =~ ^([1-5])xx$ ]]; then
+                count=$((count + 1))
+                continue
+              elif [[ "$tok" =~ ^([0-9]{3})-([0-9]{3})$ ]]; then
+                lo=${BASH_REMATCH[1]}
+                hi=${BASH_REMATCH[2]}
+                if (( 10#$lo > 10#$hi )); then
+                  echo "::error::Invalid health-status-codes range '${tok}'."
+                  exit 1
+                fi
+                count=$((count + 1))
+              elif [[ "$tok" =~ ^[0-9]{3}$ ]]; then
+                count=$((count + 1))
+              else
+                echo "::error::Invalid health-status-codes token '${tok}'. Use 2xx, 200, or 200-399, comma-separated."
+                exit 1
+              fi
+            done <<< "$spec"
+            if [ "$count" -eq 0 ]; then
+              echo "::error::health-status-codes has no status tokens. Use 2xx, 200, or 200-399, comma-separated."
+              exit 1
+            fi
+          }
+
+          health_code_ok() {
+            local code raw spec tok lo hi
+            code=$(printf '%s' "$1" | tr -d '[:space:]')
+            [[ "$code" =~ ^[0-9]{3}$ ]] || return 1
+            raw=$(read_health_spec) || exit $?
+            spec=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr ',;' '\n' | tr -s '[:space:]' '\n')
+            while IFS= read -r tok; do
+              [ -z "$tok" ] && continue
+              if [[ "$tok" =~ ^([1-5])xx$ ]]; then
+                if [[ "${code:0:1}" == "${BASH_REMATCH[1]}" ]]; then
+                  return 0
+                fi
+              elif [[ "$tok" =~ ^([0-9]{3})-([0-9]{3})$ ]]; then
+                lo=${BASH_REMATCH[1]}
+                hi=${BASH_REMATCH[2]}
+                if (( 10#$code >= 10#$lo && 10#$code <= 10#$hi )); then
+                  return 0
+                fi
+              elif [[ "$tok" =~ ^[0-9]{3}$ ]]; then
+                if [[ "$code" == "$tok" ]]; then
+                  return 0
+                fi
+              else
+                echo "::error::Invalid health-status-codes token '${tok}'. Use 2xx, 200, or 200-399, comma-separated."
+                exit 1
+              fi
+            done <<< "$spec"
+            return 1
+          }
+          validate_health_spec
           for i in $(seq 1 ${{ inputs.health-retries }}); do
             CODE=$(ssh server "curl -s -o /dev/null -w '%{http_code}' -H 'Host: $REVIEW_HOST' http://127.0.0.1/" || echo 000)
-            if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 500 ]; then
+            if health_code_ok "$CODE"; then
               echo "healthy ✅ ($REVIEW_HOST, HTTP $CODE)"
               echo "### Review app https://$REVIEW_HOST ✅" >> "$GITHUB_STEP_SUMMARY"
               exit 0
@@ -544,19 +921,121 @@ jobs:
 
       - name: Setup SSH
         if: env.SKIP != '1'
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          SSH_HOST_FINGERPRINT: ${{ inputs.ssh-host-fingerprint }}
+          ALLOW_INSECURE_SSH: ${{ inputs.allow-insecure-ssh }}
         run: |
+          set -euo pipefail
+
+          missing=()
+          [ -z "${SSH_HOST:-}" ] && missing+=(SSH_HOST)
+          [ -z "${SSH_PORT:-}" ] && missing+=(SSH_PORT)
+          [ -z "${SSH_USER:-}" ] && missing+=(SSH_USER)
+          [ -z "${SSH_KEY:-}" ] && missing+=(SSH_KEY)
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Deploy is enabled but these secrets are empty: ${missing[*]}. Pass SSH_HOST, SSH_PORT, SSH_USER and SSH_KEY, or set deploy-enabled: false for CI only."
+            exit 1
+          fi
+
+          umask 077
           mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts
-          cat >> ~/.ssh/config <<EOF
+
+          scan=$(mktemp)
+          scan_err=$(mktemp)
+          if ! ssh-keyscan -p "$SSH_PORT" -T 10 "$SSH_HOST" >"$scan" 2>"$scan_err"; then
+            echo "::error::ssh-keyscan failed for ${SSH_HOST}:${SSH_PORT}"
+            cat "$scan_err"
+            exit 1
+          fi
+          grep -vE '^[[:space:]]*(#|$)' "$scan" >"${scan}.clean" || true
+          mv "${scan}.clean" "$scan"
+          if [ ! -s "$scan" ]; then
+            echo "::error::ssh-keyscan returned no host keys for ${SSH_HOST}:${SSH_PORT}"
+            cat "$scan_err"
+            exit 1
+          fi
+
+          if [ "${ALLOW_INSECURE_SSH:-false}" = "true" ]; then
+            echo "::warning::allow-insecure-ssh is true: SSH host key verification is disabled. The key returned by ssh-keyscan is trusted as-is. Do not use this against a host you cannot already trust."
+            cat "$scan" > ~/.ssh/known_hosts
+          else
+            material=$(mktemp)
+            printf '%s\n' "${SSH_HOST_FINGERPRINT:-}" >"$material"
+            printf '%s\n' "${SSH_KNOWN_HOSTS:-}" >>"$material"
+            if [ -n "${SSH_KNOWN_HOSTS:-}" ]; then
+              kh=$(mktemp)
+              printf '%s\n' "$SSH_KNOWN_HOSTS" >"$kh"
+              if ssh-keygen -lf "$kh" -E sha256 >"${kh}.fp" 2>/dev/null; then
+                cat "${kh}.fp" >>"$material"
+              else
+                while IFS= read -r line || [ -n "$line" ]; do
+                  case "$line" in
+                    ''|\#*) continue ;;
+                  esac
+                  fp=$(printf '%s\n' "$line" | ssh-keygen -lf - -E sha256 2>/dev/null | awk '{print $2}' || true)
+                  if [ -n "$fp" ]; then
+                    printf '%s\n' "$fp" >>"$material"
+                  fi
+                done <"$kh"
+              fi
+            fi
+            trusted=$(mktemp)
+            sed -E 's/[Ss][Hh][Aa]256:/SHA256:/g' "$material" \
+              | grep -oE 'SHA256:[A-Za-z0-9+/]+={0,2}' \
+              | sort -u >"$trusted" || true
+            if [ ! -s "$trusted" ]; then
+              echo "::error::Refusing to deploy: no trusted SSH host key for ${SSH_HOST}:${SSH_PORT}. Set secret SSH_KNOWN_HOSTS (known_hosts lines or a public key) or input ssh-host-fingerprint (SHA256 fingerprint from ssh-keygen -lf). Verify that value out of band before saving it. To skip this check, set allow-insecure-ssh: true (insecure; off by default)."
+              exit 1
+            fi
+            : > ~/.ssh/known_hosts
+            matched=0
+            ignored=0
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              fp=$(printf '%s\n' "$line" | ssh-keygen -lf - -E sha256 2>/dev/null | awk '{print $2}' || true)
+              if [ -n "$fp" ] && grep -qxF "$fp" "$trusted"; then
+                printf '%s\n' "$line" >> ~/.ssh/known_hosts
+                echo "SSH host key accepted: $fp"
+                matched=$((matched + 1))
+              else
+                ignored=$((ignored + 1))
+              fi
+            done <"$scan"
+            if [ "$ignored" -gt 0 ]; then
+              echo "Ignored ${ignored} scanned host key(s) that were not in the trusted set."
+            fi
+            if [ "$matched" -eq 0 ]; then
+              echo "::error::SSH host key verification failed for ${SSH_HOST}:${SSH_PORT}. No scanned key matches the trusted fingerprint(s)."
+              echo "Scanned:"
+              ssh-keygen -lf "$scan" -E sha256 || true
+              echo "Trusted:"
+              cat "$trusted"
+              exit 1
+            fi
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+          cat > ~/.ssh/config <<EOF
           Host server
             HostName $SSH_HOST
             Port $SSH_PORT
             User $SSH_USER
             IdentityFile ~/.ssh/id_ed25519
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            GlobalKnownHostsFile /dev/null
+            UpdateHostKeys no
             ServerAliveInterval 30
           EOF
+          chmod 600 ~/.ssh/config
 
       - name: Test SSH connection
         if: env.SKIP != '1'
@@ -601,19 +1080,121 @@ jobs:
           echo "rolling back $T"
 
       - name: Setup SSH
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          SSH_HOST_FINGERPRINT: ${{ inputs.ssh-host-fingerprint }}
+          ALLOW_INSECURE_SSH: ${{ inputs.allow-insecure-ssh }}
         run: |
+          set -euo pipefail
+
+          missing=()
+          [ -z "${SSH_HOST:-}" ] && missing+=(SSH_HOST)
+          [ -z "${SSH_PORT:-}" ] && missing+=(SSH_PORT)
+          [ -z "${SSH_USER:-}" ] && missing+=(SSH_USER)
+          [ -z "${SSH_KEY:-}" ] && missing+=(SSH_KEY)
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Deploy is enabled but these secrets are empty: ${missing[*]}. Pass SSH_HOST, SSH_PORT, SSH_USER and SSH_KEY, or set deploy-enabled: false for CI only."
+            exit 1
+          fi
+
+          umask 077
           mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts
-          cat >> ~/.ssh/config <<EOF
+
+          scan=$(mktemp)
+          scan_err=$(mktemp)
+          if ! ssh-keyscan -p "$SSH_PORT" -T 10 "$SSH_HOST" >"$scan" 2>"$scan_err"; then
+            echo "::error::ssh-keyscan failed for ${SSH_HOST}:${SSH_PORT}"
+            cat "$scan_err"
+            exit 1
+          fi
+          grep -vE '^[[:space:]]*(#|$)' "$scan" >"${scan}.clean" || true
+          mv "${scan}.clean" "$scan"
+          if [ ! -s "$scan" ]; then
+            echo "::error::ssh-keyscan returned no host keys for ${SSH_HOST}:${SSH_PORT}"
+            cat "$scan_err"
+            exit 1
+          fi
+
+          if [ "${ALLOW_INSECURE_SSH:-false}" = "true" ]; then
+            echo "::warning::allow-insecure-ssh is true: SSH host key verification is disabled. The key returned by ssh-keyscan is trusted as-is. Do not use this against a host you cannot already trust."
+            cat "$scan" > ~/.ssh/known_hosts
+          else
+            material=$(mktemp)
+            printf '%s\n' "${SSH_HOST_FINGERPRINT:-}" >"$material"
+            printf '%s\n' "${SSH_KNOWN_HOSTS:-}" >>"$material"
+            if [ -n "${SSH_KNOWN_HOSTS:-}" ]; then
+              kh=$(mktemp)
+              printf '%s\n' "$SSH_KNOWN_HOSTS" >"$kh"
+              if ssh-keygen -lf "$kh" -E sha256 >"${kh}.fp" 2>/dev/null; then
+                cat "${kh}.fp" >>"$material"
+              else
+                while IFS= read -r line || [ -n "$line" ]; do
+                  case "$line" in
+                    ''|\#*) continue ;;
+                  esac
+                  fp=$(printf '%s\n' "$line" | ssh-keygen -lf - -E sha256 2>/dev/null | awk '{print $2}' || true)
+                  if [ -n "$fp" ]; then
+                    printf '%s\n' "$fp" >>"$material"
+                  fi
+                done <"$kh"
+              fi
+            fi
+            trusted=$(mktemp)
+            sed -E 's/[Ss][Hh][Aa]256:/SHA256:/g' "$material" \
+              | grep -oE 'SHA256:[A-Za-z0-9+/]+={0,2}' \
+              | sort -u >"$trusted" || true
+            if [ ! -s "$trusted" ]; then
+              echo "::error::Refusing to deploy: no trusted SSH host key for ${SSH_HOST}:${SSH_PORT}. Set secret SSH_KNOWN_HOSTS (known_hosts lines or a public key) or input ssh-host-fingerprint (SHA256 fingerprint from ssh-keygen -lf). Verify that value out of band before saving it. To skip this check, set allow-insecure-ssh: true (insecure; off by default)."
+              exit 1
+            fi
+            : > ~/.ssh/known_hosts
+            matched=0
+            ignored=0
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              fp=$(printf '%s\n' "$line" | ssh-keygen -lf - -E sha256 2>/dev/null | awk '{print $2}' || true)
+              if [ -n "$fp" ] && grep -qxF "$fp" "$trusted"; then
+                printf '%s\n' "$line" >> ~/.ssh/known_hosts
+                echo "SSH host key accepted: $fp"
+                matched=$((matched + 1))
+              else
+                ignored=$((ignored + 1))
+              fi
+            done <"$scan"
+            if [ "$ignored" -gt 0 ]; then
+              echo "Ignored ${ignored} scanned host key(s) that were not in the trusted set."
+            fi
+            if [ "$matched" -eq 0 ]; then
+              echo "::error::SSH host key verification failed for ${SSH_HOST}:${SSH_PORT}. No scanned key matches the trusted fingerprint(s)."
+              echo "Scanned:"
+              ssh-keygen -lf "$scan" -E sha256 || true
+              echo "Trusted:"
+              cat "$trusted"
+              exit 1
+            fi
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+          cat > ~/.ssh/config <<EOF
           Host server
             HostName $SSH_HOST
             Port $SSH_PORT
             User $SSH_USER
             IdentityFile ~/.ssh/id_ed25519
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            GlobalKnownHostsFile /dev/null
+            UpdateHostKeys no
             ServerAliveInterval 30
           EOF
+          chmod 600 ~/.ssh/config
 
       - name: Test SSH connection
         run: ssh server 'echo "connected as $(whoami) on $(hostname)"'
@@ -625,10 +1206,84 @@ jobs:
           ssh server "cd $APP_DIR && docker compose up -d --no-build --force-recreate $SERVICES"
 
       - name: Health check
+        env:
+          HEALTH_STATUS_CODES: ${{ inputs.health-status-codes }}
         run: |
+          read_health_spec() {
+            if [ -z "${HEALTH_STATUS_CODES+x}" ]; then
+              printf '%s' "2xx"
+            elif [ -z "$HEALTH_STATUS_CODES" ]; then
+              echo "::error::health-status-codes is empty" >&2
+              exit 1
+            else
+              printf '%s' "$HEALTH_STATUS_CODES"
+            fi
+          }
+
+          validate_health_spec() {
+            local raw spec tok lo hi count
+            raw=$(read_health_spec) || exit $?
+            spec=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr ',;' '\n' | tr -s '[:space:]' '\n')
+            count=0
+            while IFS= read -r tok; do
+              [ -z "$tok" ] && continue
+              if [[ "$tok" =~ ^([1-5])xx$ ]]; then
+                count=$((count + 1))
+                continue
+              elif [[ "$tok" =~ ^([0-9]{3})-([0-9]{3})$ ]]; then
+                lo=${BASH_REMATCH[1]}
+                hi=${BASH_REMATCH[2]}
+                if (( 10#$lo > 10#$hi )); then
+                  echo "::error::Invalid health-status-codes range '${tok}'."
+                  exit 1
+                fi
+                count=$((count + 1))
+              elif [[ "$tok" =~ ^[0-9]{3}$ ]]; then
+                count=$((count + 1))
+              else
+                echo "::error::Invalid health-status-codes token '${tok}'. Use 2xx, 200, or 200-399, comma-separated."
+                exit 1
+              fi
+            done <<< "$spec"
+            if [ "$count" -eq 0 ]; then
+              echo "::error::health-status-codes has no status tokens. Use 2xx, 200, or 200-399, comma-separated."
+              exit 1
+            fi
+          }
+
+          health_code_ok() {
+            local code raw spec tok lo hi
+            code=$(printf '%s' "$1" | tr -d '[:space:]')
+            [[ "$code" =~ ^[0-9]{3}$ ]] || return 1
+            raw=$(read_health_spec) || exit $?
+            spec=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr ',;' '\n' | tr -s '[:space:]' '\n')
+            while IFS= read -r tok; do
+              [ -z "$tok" ] && continue
+              if [[ "$tok" =~ ^([1-5])xx$ ]]; then
+                if [[ "${code:0:1}" == "${BASH_REMATCH[1]}" ]]; then
+                  return 0
+                fi
+              elif [[ "$tok" =~ ^([0-9]{3})-([0-9]{3})$ ]]; then
+                lo=${BASH_REMATCH[1]}
+                hi=${BASH_REMATCH[2]}
+                if (( 10#$code >= 10#$lo && 10#$code <= 10#$hi )); then
+                  return 0
+                fi
+              elif [[ "$tok" =~ ^[0-9]{3}$ ]]; then
+                if [[ "$code" == "$tok" ]]; then
+                  return 0
+                fi
+              else
+                echo "::error::Invalid health-status-codes token '${tok}'. Use 2xx, 200, or 200-399, comma-separated."
+                exit 1
+              fi
+            done <<< "$spec"
+            return 1
+          }
+          validate_health_spec
           for i in $(seq 1 ${{ inputs.health-retries }}); do
             CODE=$(ssh server "curl -s -o /dev/null -w '%{http_code}' $HEALTH_URL" || echo 000)
-            if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 500 ]; then
+            if health_code_ok "$CODE"; then
               echo "healthy ✅ (rollback, HTTP $CODE)"
               echo "### ↩️ Rolled back \`$IMAGE\` to :$PREV ✅" >> "$GITHUB_STEP_SUMMARY"
               exit 0
@@ -648,6 +1303,6 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           generate_release_notes: true

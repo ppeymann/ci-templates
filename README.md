@@ -50,6 +50,7 @@
 - [Server prerequisites](#-server-prerequisites)
 - [Deploy under the hood](#-deploy-under-the-hood)
 - [Versioning the templates](#-versioning-the-templates)
+- [Breaking changes](#-breaking-changes)
 - [Troubleshooting](#-troubleshooting)
 
 ---
@@ -186,7 +187,7 @@ Every stage can be switched off from your own `deploy.yml`. The names are the sa
 | `testflight-enabled`, `appstore-submit`, `play-upload-enabled` | store uploads (off by default) | ios, flutter |
 
 Skipping a stage never blocks the stages after it. A stage that is **enabled and fails** still stops everything after it (no deploy, no release).
-With `deploy-enabled: false` a tag can still create a release. With `build-enabled: false` nothing is deployed or released.
+With `deploy-enabled: false` a tag can still create a release, and the SSH secrets can be omitted. With `build-enabled: false` nothing is deployed or released.
 
 ```yaml
 jobs:
@@ -200,17 +201,27 @@ jobs:
       test-enabled: false        # 🚫 no tests
       release-enabled: false     # 🚫 no GitHub Release on tags
       trivy-enabled: false       # 🚫 no image scan
-      # deploy-enabled: false    # CI only (lint + tests + build)
+      # deploy-enabled: false    # CI only (lint + tests + build); SSH secrets can be omitted
     secrets:
       SSH_HOST: ${{ secrets.SSH_HOST }}
       SSH_PORT: ${{ secrets.SSH_PORT }}
       SSH_USER: ${{ secrets.SSH_USER }}
       SSH_KEY: ${{ secrets.SSH_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
 ```
 
 ## 🚀 Quick start
 
 Create `.github/workflows/deploy.yml` in your project and pick one of the following.
+
+> [!IMPORTANT]
+> **Permissions.** Put `contents: read` on the caller workflow. Grant `contents: write` only on the job that calls the template when a release is enabled — inside the template, only the release job creates the GitHub Release. Kubernetes callers also grant `packages: write` on that job. A sticky coverage comment needs `pull-requests: write` on that job.
+>
+> **SSH host key.** A deploy does not run until you set secret `SSH_KNOWN_HOSTS` or input `ssh-host-fingerprint` (see [Server prerequisites](#-server-prerequisites)). `secrets: inherit` passes `SSH_KNOWN_HOSTS` when the caller repo has that secret. `allow-insecure-ssh: true` skips the check and is off by default.
+>
+> **Health check.** Only HTTP **2xx** counts as healthy. `health-status-codes: "200-499"` restores the previous range.
+>
+> **CI only.** `deploy-enabled: false` does not require the SSH secrets.
 
 ### 1. Go + Docker
 
@@ -225,10 +236,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   pipeline:
+    permissions:
+      contents: write
     uses: ppeymann/ci-templates/.github/workflows/go-docker.yml@v1
     with:
       image: my-api
@@ -252,10 +265,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   pipeline:
+    permissions:
+      contents: write
     uses: ppeymann/ci-templates/.github/workflows/nextjs-docker.yml@v1
     with:
       image: my-web
@@ -266,8 +281,9 @@ jobs:
 ```
 
 > [!NOTE]
-> The health check of this template accepts any HTTP code from `200` to `499`, so a page that
-> redirects to `/login` or answers `401` still counts as "up".
+> The health check accepts **2xx** only, unless you set `health-status-codes`. A page that
+> redirects to `/login` or answers `401` does not count as up. Use `health-status-codes: "200-499"`
+> for the previous range, or point `health-url` at a route that returns 200.
 
 ### 3. Rust + Docker
 
@@ -284,10 +300,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   pipeline:
+    permissions:
+      contents: write
     uses: ppeymann/ci-templates/.github/workflows/rust-docker.yml@v1
     with:
       image: my-api
@@ -300,6 +318,7 @@ jobs:
       SSH_PORT: ${{ secrets.SSH_PORT }}
       SSH_USER: ${{ secrets.SSH_USER }}
       SSH_KEY: ${{ secrets.SSH_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
 ```
 
 > [!IMPORTANT]
@@ -319,10 +338,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   pipeline:
+    permissions:
+      contents: write
     uses: ppeymann/ci-templates/.github/workflows/django-docker.yml@v1
     with:
       image: my-backend
@@ -336,6 +357,7 @@ jobs:
       SSH_PORT: ${{ secrets.SSH_PORT }}
       SSH_USER: ${{ secrets.SSH_USER }}
       SSH_KEY: ${{ secrets.SSH_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
 ```
 
 > [!NOTE]
@@ -346,7 +368,8 @@ jobs:
 ### 5. More Docker stacks
 
 Every Docker template has the same shape as Django: `image`, `app-dir`, `services`, `health-url`,
-optional `working-directory`, and the four `SSH_*` secrets. Only the `with:` block changes, the rest
+optional `working-directory`, and the SSH secrets (`SSH_HOST`, `SSH_PORT`, `SSH_USER`, `SSH_KEY`,
+and `SSH_KNOWN_HOSTS` or `ssh-host-fingerprint`). Only the `with:` block changes, the rest
 of the caller is identical to the Django example above.
 
 <details>
@@ -363,10 +386,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   pipeline:
+    permissions:
+      contents: write
     uses: ppeymann/ci-templates/.github/workflows/fastapi-docker.yml@v1
     with:
       image: my-api
@@ -379,6 +404,7 @@ jobs:
       SSH_PORT: ${{ secrets.SSH_PORT }}
       SSH_USER: ${{ secrets.SSH_USER }}
       SSH_KEY: ${{ secrets.SSH_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
 ```
 </details>
 
@@ -396,10 +422,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   pipeline:
+    permissions:
+      contents: write
     uses: ppeymann/ci-templates/.github/workflows/spring-docker.yml@v1
     with:
       image: my-service
@@ -412,6 +440,7 @@ jobs:
       SSH_PORT: ${{ secrets.SSH_PORT }}
       SSH_USER: ${{ secrets.SSH_USER }}
       SSH_KEY: ${{ secrets.SSH_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
 ```
 </details>
 
@@ -429,10 +458,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   pipeline:
+    permissions:
+      contents: write
     uses: ppeymann/ci-templates/.github/workflows/node-docker.yml@v1
     with:
       image: my-api
@@ -444,6 +475,7 @@ jobs:
       SSH_PORT: ${{ secrets.SSH_PORT }}
       SSH_USER: ${{ secrets.SSH_USER }}
       SSH_KEY: ${{ secrets.SSH_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
 ```
 </details>
 
@@ -461,10 +493,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   pipeline:
+    permissions:
+      contents: write
     uses: ppeymann/ci-templates/.github/workflows/dotnet-docker.yml@v1
     with:
       image: my-api
@@ -477,6 +511,7 @@ jobs:
       SSH_PORT: ${{ secrets.SSH_PORT }}
       SSH_USER: ${{ secrets.SSH_USER }}
       SSH_KEY: ${{ secrets.SSH_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
 ```
 </details>
 
@@ -494,10 +529,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   pipeline:
+    permissions:
+      contents: write
     uses: ppeymann/ci-templates/.github/workflows/laravel-docker.yml@v1
     with:
       image: my-app
@@ -510,6 +547,7 @@ jobs:
       SSH_PORT: ${{ secrets.SSH_PORT }}
       SSH_USER: ${{ secrets.SSH_USER }}
       SSH_KEY: ${{ secrets.SSH_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
 ```
 </details>
 
@@ -527,10 +565,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   pipeline:
+    permissions:
+      contents: write
     uses: ppeymann/ci-templates/.github/workflows/swift-vapor-docker.yml@v1
     with:
       image: my-api
@@ -543,6 +583,7 @@ jobs:
       SSH_PORT: ${{ secrets.SSH_PORT }}
       SSH_USER: ${{ secrets.SSH_USER }}
       SSH_KEY: ${{ secrets.SSH_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
 ```
 </details>
 
@@ -565,11 +606,13 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
   pipeline:
+    permissions:
+      contents: write
+      packages: write
     uses: ppeymann/ci-templates/.github/workflows/django-k8s.yml@v1
     with:
       image: my-backend
@@ -604,10 +647,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   pipeline:
+    permissions:
+      contents: write
     uses: ppeymann/ci-templates/.github/workflows/ios-swiftui.yml@v1
     with:
       scheme: MyApp
@@ -641,10 +686,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   pipeline:
+    permissions:
+      contents: write
     uses: ppeymann/ci-templates/.github/workflows/flutter.yml@v1
     with:
       flutter-version: "3.27.0"
@@ -752,7 +799,7 @@ base64 < stage-kubeconfig.yaml | tr -d '\n' | pbcopy   # KUBE_CONFIG_STAGE (opti
 
 These features are built into every **Docker** template (`go`, `nextjs`, `django`, `fastapi`, `spring`, `node`, `dotnet`, `rust`, `laravel`, `swift-vapor`).
 `static-site.yml` has stage and review too, but no rollback.
-They are all **backward compatible**: with no new inputs a template behaves exactly like before (plus automatic rollback, which only acts when a deploy fails).
+Stage, review, and rollback stay opt-in. Host-key checks and the 2xx health default are breaking; see [Breaking changes](#-breaking-changes).
 
 ### 🧪 Stage environment (`develop`)
 
@@ -803,11 +850,13 @@ on:
         default: false
 
 permissions:
-  contents: write
-  pull-requests: write      # sticky coverage comment
+  contents: read
 
 jobs:
   pipeline:
+    permissions:
+      contents: write
+      pull-requests: write  # sticky coverage comment
     uses: ppeymann/ci-templates/.github/workflows/django-docker.yml@v1
     with:
       image: my-backend
@@ -823,6 +872,7 @@ jobs:
       SSH_PORT: ${{ secrets.SSH_PORT }}
       SSH_USER: ${{ secrets.SSH_USER }}
       SSH_KEY: ${{ secrets.SSH_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
 ```
 
 The slug is the lower-cased branch name (`feature/Login-UI` → `feature-login-ui`, max 30 chars) or `pr-<n>`. The compose project is `<image>-<slug>`.
@@ -839,7 +889,7 @@ The health check calls Traefik on the server with `Host: <slug>.<review-domain>`
 ### 📊 Coverage comment on pull requests
 
 Templates that produce coverage (go, django, fastapi, spring, dotnet, and their `-k8s` twins) post or update **one sticky comment** per PR with the total.
-The caller needs `permissions: pull-requests: write`. Without it, on fork PRs, or when there's no coverage file, the step is skipped or ignored and never fails the build.
+The job that calls the template needs `permissions: pull-requests: write`. The comment step asks for that scope and cannot exceed what the caller grants. Without it, on fork PRs, or when there's no coverage file, the step is skipped or ignored and never fails the build.
 Turn it off with `pr-coverage-comment: false`. (node, nextjs, rust, laravel and swift-vapor don't produce a coverage total yet, so they never comment.)
 
 ## 📱 App stores
@@ -888,6 +938,9 @@ Turn it off with `pr-coverage-comment: false`. (node, nextjs, rust, laravel and 
 | `test-enabled` | boolean | `true` |  | Run the test job (when false, build/deploy still run) |
 | `coverage-enabled` | boolean | `true` |  | Coverage summary, artifact and PR comment |
 | `build-enabled` | boolean | `true` |  | Build (and push) the artifact; when false, deploy and release are skipped too |
+| `health-status-codes` | string | `2xx` |  | HTTP statuses that count as healthy: `2xx`, `200`, `200-399`, comma-separated. Default is 2xx only. `200-499` restores the previous check |
+| `ssh-host-fingerprint` | string | `""` |  | Trusted SSH host-key fingerprint(s), `SHA256:…` from `ssh-keygen -lf`. Alternative to secret `SSH_KNOWN_HOSTS` |
+| `allow-insecure-ssh` | boolean | `false` |  | INSECURE. Skip host-key verification and trust ssh-keyscan. Off by default |
 | `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 
 The `test` job starts **Postgres 17** and **Redis 8** and exports
@@ -925,6 +978,9 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports
 | `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
 | `test-enabled` | boolean | `true` |  | Run the test job (when false, build/deploy still run) |
 | `build-enabled` | boolean | `true` |  | Build (and push) the artifact; when false, deploy and release are skipped too |
+| `health-status-codes` | string | `2xx` |  | HTTP statuses that count as healthy: `2xx`, `200`, `200-399`, comma-separated. Default is 2xx only. `200-499` restores the previous check |
+| `ssh-host-fingerprint` | string | `""` |  | Trusted SSH host-key fingerprint(s), `SHA256:…` from `ssh-keygen -lf`. Alternative to secret `SSH_KNOWN_HOSTS` |
+| `allow-insecure-ssh` | boolean | `false` |  | INSECURE. Skip host-key verification and trust ssh-keyscan. Off by default |
 | `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 </details>
 
@@ -936,7 +992,7 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports
 | `image` | string | – | ✅ | Docker image name, e.g. my-backend |
 | `app-dir` | string | – | ✅ | Project dir on server (has docker-compose.yml), e.g. ~/backend |
 | `services` | string | – | ✅ | Compose services to recreate, space separated, e.g. "web celery celery-beat\ |
-| `health-url` | string | – | ✅ | Health URL checked from inside the server (200-499 = healthy) |
+| `health-url` | string | – | ✅ | Health URL checked from inside the server (accepted statuses: `health-status-codes`, default 2xx) |
 | `migrate-service` | string | `""` |  | Compose service used to run migrate/collectstatic (default: first of services) |
 | `working-directory` | string | `.` |  | Folder of the Django project inside the repo (has manage.py and Dockerfile) |
 | `python-version` | string | `3.12` |  |  |
@@ -967,6 +1023,9 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports
 | `test-enabled` | boolean | `true` |  | Run the test job (when false, build/deploy still run) |
 | `coverage-enabled` | boolean | `true` |  | Coverage summary, artifact and PR comment |
 | `build-enabled` | boolean | `true` |  | Build (and push) the artifact; when false, deploy and release are skipped too |
+| `health-status-codes` | string | `2xx` |  | HTTP statuses that count as healthy: `2xx`, `200`, `200-399`, comma-separated. Default is 2xx only. `200-499` restores the previous check |
+| `ssh-host-fingerprint` | string | `""` |  | Trusted SSH host-key fingerprint(s), `SHA256:…` from `ssh-keygen -lf`. Alternative to secret `SSH_KNOWN_HOSTS` |
+| `allow-insecure-ssh` | boolean | `false` |  | INSECURE. Skip host-key verification and trust ssh-keyscan. Off by default |
 | `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 
 The `test` job starts **Postgres 17** and **Redis 8** and exports common names so most settings files work as-is:
@@ -981,7 +1040,7 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `image` | string | – | ✅ | Docker image name, e.g. my-api |
 | `app-dir` | string | – | ✅ | Project dir on server (has docker-compose.yml), e.g. ~/my-api |
 | `services` | string | – | ✅ | Compose services to recreate, space separated, e.g. "api worker\ |
-| `health-url` | string | – | ✅ | Health URL checked from inside the server (200-499 = healthy) |
+| `health-url` | string | – | ✅ | Health URL checked from inside the server (accepted statuses: `health-status-codes`, default 2xx) |
 | `working-directory` | string | `.` |  | Folder of the project inside the repo (has the Dockerfile) |
 | `python-version` | string | `3.12` |  |  |
 | `install-command` | string | `pip install -r requirements.txt` |  | Installs dependencies in CI |
@@ -1011,6 +1070,9 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `test-enabled` | boolean | `true` |  | Run the test job (when false, build/deploy still run) |
 | `coverage-enabled` | boolean | `true` |  | Coverage summary, artifact and PR comment |
 | `build-enabled` | boolean | `true` |  | Build (and push) the artifact; when false, deploy and release are skipped too |
+| `health-status-codes` | string | `2xx` |  | HTTP statuses that count as healthy: `2xx`, `200`, `200-399`, comma-separated. Default is 2xx only. `200-499` restores the previous check |
+| `ssh-host-fingerprint` | string | `""` |  | Trusted SSH host-key fingerprint(s), `SHA256:…` from `ssh-keygen -lf`. Alternative to secret `SSH_KNOWN_HOSTS` |
+| `allow-insecure-ssh` | boolean | `false` |  | INSECURE. Skip host-key verification and trust ssh-keyscan. Off by default |
 | `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 </details>
 
@@ -1022,7 +1084,7 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `image` | string | – | ✅ | Docker image name, e.g. my-service |
 | `app-dir` | string | – | ✅ | Project dir on server (has docker-compose.yml), e.g. ~/my-service |
 | `services` | string | – | ✅ | Compose services to recreate, space separated, e.g. "api worker\ |
-| `health-url` | string | – | ✅ | Health URL checked from inside the server (200-499 = healthy) |
+| `health-url` | string | – | ✅ | Health URL checked from inside the server (accepted statuses: `health-status-codes`, default 2xx) |
 | `working-directory` | string | `.` |  | Folder of the project inside the repo (has the Dockerfile) |
 | `java-version` | string | `21` |  |  |
 | `build-tool` | string | `auto` |  | maven \| gradle \| auto (detects mvnw/pom.xml or gradlew) |
@@ -1047,6 +1109,9 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `test-enabled` | boolean | `true` |  | Run the test job (when false, build/deploy still run) |
 | `coverage-enabled` | boolean | `true` |  | Coverage summary, artifact and PR comment |
 | `build-enabled` | boolean | `true` |  | Build (and push) the artifact; when false, deploy and release are skipped too |
+| `health-status-codes` | string | `2xx` |  | HTTP statuses that count as healthy: `2xx`, `200`, `200-399`, comma-separated. Default is 2xx only. `200-499` restores the previous check |
+| `ssh-host-fingerprint` | string | `""` |  | Trusted SSH host-key fingerprint(s), `SHA256:…` from `ssh-keygen -lf`. Alternative to secret `SSH_KNOWN_HOSTS` |
+| `allow-insecure-ssh` | boolean | `false` |  | INSECURE. Skip host-key verification and trust ssh-keyscan. Off by default |
 | `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 </details>
 
@@ -1058,7 +1123,7 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `image` | string | – | ✅ | Docker image name, e.g. my-api |
 | `app-dir` | string | – | ✅ | Project dir on server (has docker-compose.yml), e.g. ~/my-api |
 | `services` | string | – | ✅ | Compose services to recreate, space separated, e.g. "api worker\ |
-| `health-url` | string | – | ✅ | Health URL checked from inside the server (200-499 = healthy) |
+| `health-url` | string | – | ✅ | Health URL checked from inside the server (accepted statuses: `health-status-codes`, default 2xx) |
 | `working-directory` | string | `.` |  | Folder of the project inside the repo (has the Dockerfile) |
 | `node-version` | string | `22` |  |  |
 | `lint-enabled` | boolean | `true` |  |  |
@@ -1083,6 +1148,9 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
 | `test-enabled` | boolean | `true` |  | Run the test job (when false, build/deploy still run) |
 | `build-enabled` | boolean | `true` |  | Build (and push) the artifact; when false, deploy and release are skipped too |
+| `health-status-codes` | string | `2xx` |  | HTTP statuses that count as healthy: `2xx`, `200`, `200-399`, comma-separated. Default is 2xx only. `200-499` restores the previous check |
+| `ssh-host-fingerprint` | string | `""` |  | Trusted SSH host-key fingerprint(s), `SHA256:…` from `ssh-keygen -lf`. Alternative to secret `SSH_KNOWN_HOSTS` |
+| `allow-insecure-ssh` | boolean | `false` |  | INSECURE. Skip host-key verification and trust ssh-keyscan. Off by default |
 | `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 </details>
 
@@ -1094,7 +1162,7 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `image` | string | – | ✅ | Docker image name, e.g. my-api |
 | `app-dir` | string | – | ✅ | Project dir on server (has docker-compose.yml), e.g. ~/my-api |
 | `services` | string | – | ✅ | Compose services to recreate, space separated, e.g. "api worker\ |
-| `health-url` | string | – | ✅ | Health URL checked from inside the server (200-499 = healthy) |
+| `health-url` | string | – | ✅ | Health URL checked from inside the server (accepted statuses: `health-status-codes`, default 2xx) |
 | `working-directory` | string | `.` |  | Folder of the project inside the repo (has the Dockerfile) |
 | `dotnet-version` | string | `9.0.x` |  |  |
 | `project` | string | `""` |  | Solution/project file to build and test (empty = auto in working-directory) |
@@ -1120,6 +1188,9 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `test-enabled` | boolean | `true` |  | Run the test job (when false, build/deploy still run) |
 | `coverage-enabled` | boolean | `true` |  | Coverage summary, artifact and PR comment |
 | `build-enabled` | boolean | `true` |  | Build (and push) the artifact; when false, deploy and release are skipped too |
+| `health-status-codes` | string | `2xx` |  | HTTP statuses that count as healthy: `2xx`, `200`, `200-399`, comma-separated. Default is 2xx only. `200-499` restores the previous check |
+| `ssh-host-fingerprint` | string | `""` |  | Trusted SSH host-key fingerprint(s), `SHA256:…` from `ssh-keygen -lf`. Alternative to secret `SSH_KNOWN_HOSTS` |
+| `allow-insecure-ssh` | boolean | `false` |  | INSECURE. Skip host-key verification and trust ssh-keyscan. Off by default |
 | `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 </details>
 
@@ -1131,7 +1202,7 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `image` | string | – | ✅ | Docker image name, e.g. my-api |
 | `app-dir` | string | – | ✅ | Project dir on server (has docker-compose.yml), e.g. ~/my-api |
 | `services` | string | – | ✅ | Compose services to recreate, space separated, e.g. "api worker\ |
-| `health-url` | string | – | ✅ | Health URL checked from inside the server (200-499 = healthy) |
+| `health-url` | string | – | ✅ | Health URL checked from inside the server (accepted statuses: `health-status-codes`, default 2xx) |
 | `working-directory` | string | `.` |  | Folder of the project inside the repo (has the Dockerfile) |
 | `bin-name` | string | `""` |  | Binary name for release assets (default: image name) |
 | `test-env` | string | `""` |  | Extra KEY=VALUE lines for the test job |
@@ -1155,6 +1226,9 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `lint-enabled` | boolean | `true` |  | Run lint / format / vet steps |
 | `test-enabled` | boolean | `true` |  | Run the test job (when false, build/deploy still run) |
 | `build-enabled` | boolean | `true` |  | Build (and push) the artifact; when false, deploy and release are skipped too |
+| `health-status-codes` | string | `2xx` |  | HTTP statuses that count as healthy: `2xx`, `200`, `200-399`, comma-separated. Default is 2xx only. `200-499` restores the previous check |
+| `ssh-host-fingerprint` | string | `""` |  | Trusted SSH host-key fingerprint(s), `SHA256:…` from `ssh-keygen -lf`. Alternative to secret `SSH_KNOWN_HOSTS` |
+| `allow-insecure-ssh` | boolean | `false` |  | INSECURE. Skip host-key verification and trust ssh-keyscan. Off by default |
 | `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 </details>
 
@@ -1166,7 +1240,7 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `image` | string | – | ✅ | Docker image name, e.g. my-app |
 | `app-dir` | string | – | ✅ | Project dir on server (has docker-compose.yml), e.g. ~/my-app |
 | `services` | string | – | ✅ | Compose services to recreate, space separated, e.g. "api worker\ |
-| `health-url` | string | – | ✅ | Health URL checked from inside the server (200-499 = healthy) |
+| `health-url` | string | – | ✅ | Health URL checked from inside the server (accepted statuses: `health-status-codes`, default 2xx) |
 | `working-directory` | string | `.` |  | Folder of the project inside the repo (has the Dockerfile) |
 | `php-version` | string | `8.3` |  |  |
 | `node-build` | boolean | `false` |  | Also run npm ci && npm run build (Vite assets) in CI |
@@ -1194,6 +1268,9 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `lint-enabled` | boolean | `true` |  | Run lint / format / vet steps |
 | `test-enabled` | boolean | `true` |  | Run the test job (when false, build/deploy still run) |
 | `build-enabled` | boolean | `true` |  | Build (and push) the artifact; when false, deploy and release are skipped too |
+| `health-status-codes` | string | `2xx` |  | HTTP statuses that count as healthy: `2xx`, `200`, `200-399`, comma-separated. Default is 2xx only. `200-499` restores the previous check |
+| `ssh-host-fingerprint` | string | `""` |  | Trusted SSH host-key fingerprint(s), `SHA256:…` from `ssh-keygen -lf`. Alternative to secret `SSH_KNOWN_HOSTS` |
+| `allow-insecure-ssh` | boolean | `false` |  | INSECURE. Skip host-key verification and trust ssh-keyscan. Off by default |
 | `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 </details>
 
@@ -1205,7 +1282,7 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `image` | string | – | ✅ | Docker image name, e.g. my-api |
 | `app-dir` | string | – | ✅ | Project dir on server (has docker-compose.yml), e.g. ~/my-api |
 | `services` | string | – | ✅ | Compose services to recreate, space separated, e.g. "api worker\ |
-| `health-url` | string | – | ✅ | Health URL checked from inside the server (200-499 = healthy) |
+| `health-url` | string | – | ✅ | Health URL checked from inside the server (accepted statuses: `health-status-codes`, default 2xx) |
 | `working-directory` | string | `.` |  | Folder of the project inside the repo (has the Dockerfile) |
 | `swift-version` | string | `6.0` |  | Tag of the official swift image used for build/test |
 | `test-env` | string | `""` |  | Extra KEY=VALUE lines for the test job |
@@ -1228,6 +1305,9 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `rollback` | boolean | `false` |  | Manual rollback: skip build, restore :previous (use with workflow_dispatch) |
 | `test-enabled` | boolean | `true` |  | Run the test job (when false, build/deploy still run) |
 | `build-enabled` | boolean | `true` |  | Build (and push) the artifact; when false, deploy and release are skipped too |
+| `health-status-codes` | string | `2xx` |  | HTTP statuses that count as healthy: `2xx`, `200`, `200-399`, comma-separated. Default is 2xx only. `200-499` restores the previous check |
+| `ssh-host-fingerprint` | string | `""` |  | Trusted SSH host-key fingerprint(s), `SHA256:…` from `ssh-keygen -lf`. Alternative to secret `SSH_KNOWN_HOSTS` |
+| `allow-insecure-ssh` | boolean | `false` |  | INSECURE. Skip host-key verification and trust ssh-keyscan. Off by default |
 | `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 </details>
 
@@ -1269,7 +1349,7 @@ The `test` job starts **Postgres 17** and **Redis 8** and exports common names s
 | `rollout-timeout` | string | `5m` |  |  |
 | `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 
-Every `*-k8s.yml` takes its Docker twin's inputs **minus** `app-dir`, `service(s)`, `health-url`, `health-retries`, `platform` and the compose-migration inputs, **plus** `registry`, `image-namespace`, `build-platforms` (e.g. `linux/amd64,linux/arm64`) and all deploy inputs above except `image-ref`. Its `deploy-branch` input is not used for k8s; use `stage-branches`.
+Every `*-k8s.yml` takes its Docker twin's inputs **minus** `app-dir`, `service(s)`, `health-url`, `health-retries`, `health-status-codes`, `ssh-host-fingerprint`, `allow-insecure-ssh`, `platform` and the compose-migration inputs, **plus** `registry`, `image-namespace`, `build-platforms` (e.g. `linux/amd64,linux/arm64`) and all deploy inputs above except `image-ref`. Its `deploy-branch` input is not used for k8s; use `stage-branches`. Kubernetes templates do not open SSH.
 </details>
 
 <details>
@@ -1338,6 +1418,9 @@ Every `*-k8s.yml` takes its Docker twin's inputs **minus** `app-dir`, `service(s
 | `stage-build-env` | string | `""` |  | Extra KEY=VALUE build env for STAGE builds (added after build-env) |
 | `review-enabled` | boolean | `false` |  | rsync each branch / same-repo PR build to <remote-dir>-review/<slug> |
 | `review-domain` | string | `""` |  | Shown as the review URL: https://<slug>.<review-domain> (your web server maps it) |
+| `health-status-codes` | string | `2xx` |  | HTTP statuses that count as healthy: `2xx`, `200`, `200-399`, comma-separated. Default is 2xx only. `200-499` restores the previous check |
+| `ssh-host-fingerprint` | string | `""` |  | Trusted SSH host-key fingerprint(s), `SHA256:…` from `ssh-keygen -lf`. Alternative to secret `SSH_KNOWN_HOSTS` |
+| `allow-insecure-ssh` | boolean | `false` |  | INSECURE. Skip host-key verification and trust ssh-keyscan. Off by default |
 | `deploy-enabled` | boolean | `true` |  | Run deploy jobs (incl. stage/review/cleanup/rollback); false = CI only |
 </details>
 
@@ -1347,10 +1430,11 @@ Set them in **Settings → Secrets and variables → Actions** of each project r
 
 | Name | Kind | Example | Used by |
 |---|---|---|---|
-| `SSH_HOST` | Secret | `203.0.113.10` | all `*-docker.yml` + static-site |
-| `SSH_PORT` | Secret | `22` | all `*-docker.yml` + static-site |
-| `SSH_USER` | Secret | `deploy` | all `*-docker.yml` + static-site |
-| `SSH_KEY` | Secret | contents of the **private** deploy key | all `*-docker.yml` + static-site |
+| `SSH_HOST` | Secret | `203.0.113.10` | Docker templates + static-site. Required only when a deploy job runs |
+| `SSH_PORT` | Secret | `22` | same |
+| `SSH_USER` | Secret | `deploy` | same |
+| `SSH_KEY` | Secret | contents of the **private** deploy key | same |
+| `SSH_KNOWN_HOSTS` | Secret | known_hosts line, public key, or `SHA256:…` | same. Required for deploy unless `ssh-host-fingerprint` is set or `allow-insecure-ssh` is true |
 | `KUBE_CONFIG_PROD` | Secret | `base64` kubeconfig (prod; also stage/review if no stage one) | `*-k8s.yml`, `k8s-deploy.yml` |
 | `KUBE_CONFIG_STAGE` | Secret (optional) | `base64` kubeconfig for stage + review | `*-k8s.yml`, `k8s-deploy.yml` |
 | `REGISTRY_USER` / `REGISTRY_PASSWORD` | Secret (optional) | Docker Hub / Harbor creds | `*-k8s.yml` with a non-GHCR `registry` |
@@ -1378,6 +1462,12 @@ ssh-copy-id -f -i ~/.ssh/gh_actions.pub user@server
 
 # 3. verify ONLY this key is used
 ssh -F /dev/null -i ~/.ssh/gh_actions -o IdentitiesOnly=yes -o IdentityAgent=none user@server 'echo ok'
+
+# 4. read the host key on the server (console or a session you already trust)
+ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+# Pass that SHA256:… value as ssh-host-fingerprint, or store known_hosts lines in SSH_KNOWN_HOSTS.
+# If you build the secret with ssh-keyscan, compare its fingerprint to the line above first.
+# ssh-keyscan by itself does not prove which server answered.
 ```
 
 | Template | The server needs |
@@ -1426,6 +1516,7 @@ sequenceDiagram
 
 **Versions:** a `v*` tag becomes the image tag (`v1.2.0`); everything else becomes `sha-<7 chars>`.
 `concurrency: deploy-<image>-<environment>` makes sure two deploys of the same app and environment never overlap.
+The health check accepts `health-status-codes` (default **2xx**). Before the first SSH command, the deploy job compares the key from `ssh-keyscan` to `SSH_KNOWN_HOSTS` or `ssh-host-fingerprint` and fails if they differ.
 
 ## 🏷 Versioning the templates
 
@@ -1440,19 +1531,35 @@ git tag -f v1 && git push origin v1 --force
 > Moving `v1` updates **every** project on its next run. For breaking changes, create `v2`
 > and migrate projects one by one.
 
+Dependabot watches `.github/workflows` and opens a pull request when a pinned action publishes a new release. The pin comment (`# v4.4.0`) is the version it updates.
+
+## ⚠️ Breaking changes
+
+These templates no longer behave like the previous `v1` tag. Publish this revision as **`v2`** and move callers one repo at a time. Do not force-move `v1` onto this commit.
+
+1. **SSH host key is required for deploy.** `ssh-keyscan` output is not trusted by itself. Set secret `SSH_KNOWN_HOSTS` (known_hosts lines or a public key) or input `ssh-host-fingerprint` (`SHA256:…` from `ssh-keygen -lf`). The workflow installs only scanned keys whose fingerprint is in that set, and the deploy fails on a mismatch or when neither value is set. `allow-insecure-ssh: true` restores trust-on-first-use and is **off** by default.
+2. **Health checks accept 2xx only.** HTTP 3xx and 4xx (including 404) fail the deploy. Set `health-status-codes` to `200-499` to keep the old range, or to a list such as `2xx,3xx` or `200,301`.
+3. **SSH secrets are optional on `workflow_call`.** A CI-only caller (`deploy-enabled: false`) no longer has to pass `SSH_HOST`, `SSH_PORT`, `SSH_USER`, and `SSH_KEY`. If a deploy job runs and any of them is empty, that job fails immediately with the missing names.
+4. **`contents: write` is not the workflow default.** Caller examples use `contents: read` at workflow level and `contents: write` on the job that calls the template. Inside each template, only the release job has `contents: write`. A caller that leaves the whole workflow at `contents: read` cannot create a GitHub Release.
+
+Stage, review apps, rollback, and the on/off inputs (`test-enabled`, `release-enabled`, `deploy-enabled`, and the rest) are unchanged.
+
 ## 🩺 Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | Run fails in **0 s**, "workflow is not valid" | YAML indentation error in the template | Validate the YAML, push, move `v1` |
 | "Unable to find reusable workflow" / can't read the file | File not pushed, `v1` not moved, wrong file name, or repo not accessible | Check `git ls-tree -r v1 --name-only`, match the name in `uses:` exactly, keep `ci-templates` public (or same owner) |
-| `Secret SSH_HOST is required, but not provided` | `secrets: inherit` across different owners | Pass secrets explicitly |
+| `these secrets are empty: SSH_HOST` (or `SSH_PORT` / `SSH_USER` / `SSH_KEY`) | Deploy is enabled and the caller did not pass that secret | Pass all four, or set `deploy-enabled: false` for CI only. `secrets: inherit` only works when both repos have the same owner; otherwise pass each secret |
+| `no trusted SSH host key` / `SSH host key verification failed` | `SSH_KNOWN_HOSTS` and `ssh-host-fingerprint` are both empty, or the server presented a different key | Read the fingerprint on the server with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` and set one of the two. `allow-insecure-ssh: true` skips the check |
 | `Permission denied (publickey)` | Deploy public key not on the server | `ssh-copy-id -f -i ~/.ssh/gh_actions.pub user@server` |
 | Push does not start the workflow | Branch is `master` but trigger is `main`, or no new commit | `git branch -m master main`, or `git commit --allow-empty -m "ci: retrigger"` |
+| Health check fails on HTTP 3xx/4xx | Default accepted status is 2xx | Set `health-status-codes` (`200-499` is the old range) or fix `health-url` |
 | Health check fails | App can't reach DB/config, wrong port or path | Read the 50 log lines printed by the job; check `.env` and `health-url` |
 | Django `check` / tests fail with `ImproperlyConfigured` | Settings need an env var CI doesn't set | Add it with `test-env` (e.g. `DJANGO_SETTINGS_MODULE=...`) |
 | Deploy stops at **Migrate** | Migration error, or service not using `image: <image>:latest` | Read the job log; fix the migration; check `docker-compose.yml` |
-| `denied: installation not allowed to Write organization package` / push 403 | Caller lacks `packages: write`, or the GHCR package isn't linked to the repo | Add `permissions: packages: write`; in the package settings give the repo **Write** access |
+| `denied: installation not allowed to Write organization package` / push 403 | Caller lacks `packages: write`, or the GHCR package isn't linked to the repo | Grant `packages: write` on the job that calls the template; in the package settings give the repo **Write** access |
+| Release job cannot create the GitHub Release | Caller workflow is `contents: read` and the calling job does not raise it | Set `contents: write` on that job. The template only requests write on the release job |
 | Pods `ImagePullBackOff` | Cluster can't pull from GHCR (private package) | Create the `ghcr` `docker-registry` secret and reference it in `imagePullSecrets` |
 | `error: unable to load kubeconfig` / `Unauthorized` | `KUBE_CONFIG_PROD`/`_STAGE` not base64, or the token expired | `base64 < kubeconfig \| tr -d '\n'`; use a long-lived ServiceAccount token |
 | `forbidden: User "system:serviceaccount:…" cannot …` | CI ServiceAccount missing a verb | Apply / extend [`examples/k8s/ci-rbac.yaml`](examples/k8s/ci-rbac.yaml) |
