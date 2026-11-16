@@ -193,6 +193,9 @@ defaults:
   run:
     shell: bash
 
+permissions:
+  contents: read
+
 jobs:
   # ───────────── 1. prepare ─────────────
   prepare:
@@ -205,7 +208,7 @@ jobs:
       run:
         working-directory: ${{ inputs.working-directory }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Version and deploy decision
         id: meta
@@ -221,11 +224,12 @@ jobs:
             echo "deploy=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: ${{ inputs.working-directory }}
 
@@ -279,13 +283,14 @@ jobs:
       run:
         working-directory: ${{ inputs.working-directory }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: ${{ inputs.working-directory }}
 
@@ -395,12 +400,12 @@ jobs:
     env:
       VERSION: ${{ needs.target.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
         if: contains(inputs.build-platforms, ',')
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Image name
         id: ref
@@ -411,7 +416,7 @@ jobs:
           echo "REPO=$REPO" >> "$GITHUB_ENV"
           echo "ref=$REPO:$VERSION" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ inputs.registry }}
           username: ${{ secrets.REGISTRY_USER || github.actor }}
@@ -429,7 +434,7 @@ jobs:
 
       - name: Scan pushed image (trivy)
         if: inputs.trivy-enabled
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         env:
           TRIVY_USERNAME: ${{ secrets.REGISTRY_USER || github.actor }}
           TRIVY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD || github.token }}
@@ -462,9 +467,9 @@ jobs:
       ISSUER: ${{ needs.target.outputs.issuer }}
       REPLICAS: ${{ needs.target.outputs.replicas }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: azure/setup-kubectl@v4
+      - uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
 
       - name: Kubeconfig (${{ env.TARGET }})
         env:
@@ -479,7 +484,7 @@ jobs:
           [ -n "$CTX" ] && kubectl config use-context "$CTX"
           kubectl -n "$NS" get deployments
 
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
         if: inputs.method == 'helm'
 
       - name: Resolve container
@@ -637,7 +642,7 @@ jobs:
           [ -z "$NS" ] && NS="${{ inputs.prod-k8s-namespace }}"
           { echo "NAME=$NAME"; echo "NS=$NS"; } >> "$GITHUB_ENV"
 
-      - uses: azure/setup-kubectl@v4
+      - uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
         if: env.SKIP != '1'
 
       - name: Kubeconfig (stage)
@@ -654,7 +659,7 @@ jobs:
           [ -n "$CTX" ] && kubectl config use-context "$CTX"
           kubectl -n "$NS" get deployments
 
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
         if: env.SKIP != '1' && inputs.method == 'helm'
 
       - name: Delete review env
@@ -681,10 +686,11 @@ jobs:
       run:
         working-directory: ${{ inputs.working-directory }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
+          toolchain: stable
           targets: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
 
       - name: Install arm64 linker
@@ -705,7 +711,7 @@ jobs:
           done
           cd "$GITHUB_WORKSPACE/dist" && sha256sum ./* > checksums.txt
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           generate_release_notes: true
           files: dist/*
